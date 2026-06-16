@@ -1,0 +1,36 @@
+# Oxru configuration — copy to one of:
+#   ~/.config/oxru/config.toml          (applies everywhere)
+#   <your-project>/.oxru/config.toml    (applies to that project; wins over global)
+#
+# Everything is optional; anything left out keeps the default. A malformed file
+# is ignored rather than crashing the editor.
+
+# Icon set: "nerd" (default, needs a Nerd Font), "unicode", or "ascii".
+# The windowed (--gui) mode bundles its own fonts, so "nerd" works there.
+icons = "nerd"
+
+# Override any theme colour with a "#rrggbb" value. The editor chrome (borders,
+# titles, active tabs, folder names, highlights) follows `accent` — the default
+# is green; the Settings dialog (Ctrl+,) also lets you pick from popular colors.
+# Everything else is the VSCode "Default Dark" (Dark+) palette.
+[theme]
+bg        = "#1e1e1e"  # editor background
+bg_dark   = "#252526"  # dialog / footer background
+bg_light  = "#37373d"  # borders, separators
+fg        = "#d4d4d4"  # primary text
+fg_dim    = "#858585"  # line numbers, dim labels
+accent    = "#4caf50"  # focus, active tabs, highlights, current line number
+accent_fg = "#ffffff"  # text on filled accents
+# sel_bg (selected row) is auto-derived from accent unless you set it here.
+# token colours (also used by syntax highlighting):
+green     = "#6a9955"  # comments
+orange    = "#ce9178"  # strings
+blue      = "#569cd6"  # keywords
+yellow    = "#dcdcaa"  # functions
+cyan      = "#4ec9b0"  # types
+# also: red, purple, comment, status_bg, sel_bg
+
+# Windowed-mode font size, in logical points. The Settings dialog changes this
+# live and writes it back here.
+[gui]
+font_size = 24

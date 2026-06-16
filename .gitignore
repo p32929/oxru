@@ -1,0 +1,7 @@
+/target
+
+# Local, per-machine config (e.g. a registry path for testing). Not committed.
+/.oxru/
+
+# Per-project Oxru config / plugins live under .oxru/ in *user* projects; this
+# repo ships its sample plugin under plugins/ instead.
