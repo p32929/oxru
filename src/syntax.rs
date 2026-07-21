@@ -99,7 +99,9 @@ pub fn highlight(source: &str, lang: Option<&'static Lang>, theme: &Theme) -> Ve
                 None => return plain(source),
             }
         }
-        let cfg = map.get(lang.name).expect("just inserted");
+        let Some(cfg) = map.get(lang.name) else {
+            return plain(source);
+        };
         highlight_with(cfg, source, theme).unwrap_or_else(|| plain(source))
     })
 }
@@ -313,7 +315,12 @@ fn push_text(lines: &mut Vec<Vec<Span>>, text: &str, style: Style) {
         first = false;
         let piece = piece.strip_suffix('\r').unwrap_or(piece);
         if !piece.is_empty() {
-            lines.last_mut().unwrap().push((piece.to_string(), style));
+            if lines.is_empty() {
+                lines.push(Vec::new());
+            }
+            if let Some(last) = lines.last_mut() {
+                last.push((piece.to_string(), style));
+            }
         }
     }
 }

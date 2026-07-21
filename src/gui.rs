@@ -132,8 +132,8 @@ fn build_terminal(
             .with_fg_color(fg)
             .with_bg_color(bg)
             .with_width_and_height(Dimensions {
-                width: NonZeroU32::new(size.width.max(1)).unwrap(),
-                height: NonZeroU32::new(size.height.max(1)).unwrap(),
+                width: NonZeroU32::new(size.width.max(1)).unwrap_or(NonZeroU32::MIN),
+                height: NonZeroU32::new(size.height.max(1)).unwrap_or(NonZeroU32::MIN),
             })
             // Explicit double-buffered vsync: without this the backend's
             // default (platform-chosen) present mode can end up triple-

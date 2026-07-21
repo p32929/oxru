@@ -219,7 +219,7 @@ impl TerminalPane {
                         Ok(n) => {
                             // Parse off the UI thread so output is consumed even
                             // while the event loop is parked.
-                            parser.lock().unwrap().process(&buf[..n]);
+                            parser.lock().unwrap_or_else(|e| e.into_inner()).process(&buf[..n]);
                             pending.fetch_add(n as u64, Ordering::Release);
                             // Stamp the first chunk of a burst so pump() can measure
                             // how long it waited to be shown (the freeze probe).
@@ -277,7 +277,7 @@ impl TerminalPane {
             // Latency probe: how long did this output wait for a frame? A large
             // value means the UI event loop was parked (the freeze) — log it so a
             // recurrence is captured as hard evidence, not a vague report.
-            if let Some(t) = self.stamp.lock().unwrap().take() {
+            if let Some(t) = self.stamp.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 let lag = t.elapsed();
                 if lag >= Duration::from_millis(250) {
                     tracing::warn!(
@@ -287,7 +287,7 @@ impl TerminalPane {
                 }
             }
             // Keep the view anchored where the user left it (0 = live bottom).
-            let mut p = self.parser.lock().unwrap();
+            let mut p = self.parser.lock().unwrap_or_else(|e| e.into_inner());
             p.screen_mut().set_scrollback(self.scroll);
             self.scroll = p.screen().scrollback();
         }
@@ -320,7 +320,7 @@ impl TerminalPane {
     /// Jump back to the live bottom of the terminal.
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = 0;
-        self.parser.lock().unwrap().screen_mut().set_scrollback(0);
+        self.parser.lock().unwrap_or_else(|e| e.into_inner()).screen_mut().set_scrollback(0);
     }
 
     /// Current scrollback offset (0 = at the live bottom).
@@ -332,7 +332,7 @@ impl TerminalPane {
     /// screen. When it does, PageUp/PageDown belong to that program, not our
     /// scrollback — there's no scrollback on the alt screen anyway.
     pub fn on_alternate_screen(&self) -> bool {
-        self.parser.lock().unwrap().screen().alternate_screen()
+        self.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().alternate_screen()
     }
 
     // ---- selection (scrollback-aware) ----------------------------------
@@ -364,7 +364,7 @@ impl TerminalPane {
 
     /// Set the scrollback offset directly (clamped to the real history depth).
     fn set_scroll(&mut self, s: usize) {
-        let mut p = self.parser.lock().unwrap();
+        let mut p = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         p.screen_mut().set_scrollback(s);
         self.scroll = p.screen().scrollback();
     }
@@ -487,7 +487,7 @@ impl TerminalPane {
     /// Seed the cursor at the shell cursor if there's no selection yet.
     fn start_from_shell_cursor(&mut self) {
         if self.sel_cursor.is_none() {
-            let (r, c) = self.parser.lock().unwrap().screen().cursor_position();
+            let (r, c) = self.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().cursor_position();
             self.sel_cursor = Some((self.cell_lineid(r), c));
         }
     }
@@ -507,7 +507,7 @@ impl TerminalPane {
     /// The column of the word boundary reached by moving from `(row, col)` in
     /// `dir` (words are alphanumeric / underscore runs; everything else is a gap).
     fn word_boundary(&self, row: u16, col: u16, dir: i32) -> u16 {
-        let guard = self.parser.lock().unwrap();
+        let guard = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         let screen = guard.screen();
         let ch_at = |c: u16| -> char {
             screen
@@ -557,7 +557,7 @@ impl TerminalPane {
     /// Enter copy mode: park a free cursor at the shell cursor, no selection yet.
     pub fn enter_copy_mode(&mut self) {
         self.copy_mode = true;
-        let (r, c) = self.parser.lock().unwrap().screen().cursor_position();
+        let (r, c) = self.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().cursor_position();
         self.sel_cursor = Some((self.cell_lineid(r), c));
         self.sel_anchor = None;
     }
@@ -626,7 +626,7 @@ impl TerminalPane {
             };
             let mut line = String::new();
             {
-                let guard = self.parser.lock().unwrap();
+                let guard = self.parser.lock().unwrap_or_else(|e| e.into_inner());
                 let screen = guard.screen();
                 for cc in c0..c1 {
                     match screen.cell(r, cc) {
@@ -695,14 +695,14 @@ impl TerminalPane {
     /// it instead of using them for oxru's own selection & scrollback. Holding
     /// Shift bypasses this so local text selection still works.
     pub fn wants_mouse(&self) -> bool {
-        self.parser.lock().unwrap().screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+        self.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
     }
 
     /// Whether the program reports motion (drag) events, not just press/release.
     pub fn wants_mouse_motion(&self) -> bool {
         use vt100::MouseProtocolMode as M;
         matches!(
-            self.parser.lock().unwrap().screen().mouse_protocol_mode(),
+            self.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().mouse_protocol_mode(),
             M::ButtonMotion | M::AnyMotion
         )
     }
@@ -715,7 +715,7 @@ impl TerminalPane {
     pub fn send_mouse(&mut self, cb: u8, col: u16, row: u16, release: bool) {
         use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
         let (mode, enc) = {
-            let guard = self.parser.lock().unwrap();
+            let guard = self.parser.lock().unwrap_or_else(|e| e.into_inner());
             let screen = guard.screen();
             (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
         };
@@ -765,7 +765,7 @@ impl TerminalPane {
         self.scroll_to_bottom();
         // Normalize newlines to CR, which is what a terminal paste delivers.
         let body = text.replace("\r\n", "\r").replace('\n', "\r");
-        let bracketed = self.parser.lock().unwrap().screen().bracketed_paste();
+        let bracketed = self.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().bracketed_paste();
         if bracketed {
             self.send_input(b"\x1b[200~");
             self.send_input(body.as_bytes());
@@ -790,7 +790,7 @@ impl TerminalPane {
             pixel_width: 0,
             pixel_height: 0,
         });
-        let mut p = self.parser.lock().unwrap();
+        let mut p = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         p.screen_mut().set_size(rows, cols);
         // A resize can change the scrollback bounds; keep our offset valid.
         p.screen_mut().set_scrollback(self.scroll);
@@ -798,7 +798,7 @@ impl TerminalPane {
     }
 
     pub fn screen(&self) -> ScreenGuard<'_> {
-        ScreenGuard(self.parser.lock().unwrap())
+        ScreenGuard(self.parser.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 

@@ -139,10 +139,11 @@ impl Config {
     /// offered choices doesn't leave the Settings picker showing the wrong one.
     pub fn gui_fps(&self) -> u32 {
         let raw = self.gui.fps.unwrap_or(60);
-        *FPS_OPTIONS
+        FPS_OPTIONS
             .iter()
             .min_by_key(|&&f| (f as i64 - raw as i64).abs())
-            .expect("FPS_OPTIONS is non-empty")
+            .copied()
+            .unwrap_or(60)
     }
 
     /// Dialog/terminal-modal size as a percent of the screen (default 99 —

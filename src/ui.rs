@@ -1887,8 +1887,15 @@ fn render_editor_pane(f: &mut Frame, area: Rect, app: &mut App, idx: usize, acti
         let last_visible = (scroll_row + height).min(b.line_count());
         let cur = app.find.current;
         let buf = f.buffer_mut();
+        let len = b.rope.len_chars();
         for (mi, &(ms, me)) in app.find.matches.iter().enumerate() {
-            if me <= ms {
+            // `find.matches` is a cache of char offsets from whenever it was
+            // last (re)computed — normally kept in sync with edits, but this
+            // guards against ever rendering one that's drifted out of range
+            // for the buffer's *current* content (ropey panics on an
+            // out-of-bounds char index, which would otherwise crash the
+            // whole app on the very next frame).
+            if me <= ms || ms > len || me > len {
                 continue;
             }
             let first_row = b.rope.char_to_line(ms);

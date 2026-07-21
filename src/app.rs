@@ -910,7 +910,9 @@ impl App {
             // Welcome (no-folder) window: reuse it for the first folder, and open
             // any extras in new windows.
             let mut iter = targets.into_iter();
-            let first = iter.next().unwrap();
+            let Some(first) = iter.next() else {
+                return; // targets.is_empty() already returned above; unreachable in practice
+            };
             let extras: Vec<PathBuf> = iter.collect();
             for path in &extras {
                 spawn_window(path);
@@ -1317,6 +1319,7 @@ impl App {
             Ok(mut buf) => {
                 buf.id = self.next_buffer_id;
                 self.next_buffer_id += 1;
+                let new_id = buf.id;
                 self.editors.push(buf);
                 self.active_editor = Some(self.editors.len() - 1);
                 self.status = format!("Opened {}", path.display());
@@ -1332,7 +1335,7 @@ impl App {
                 // forces that first render to always treat this as a fresh
                 // cursor and snap the view to row 0.
                 self.last_cursor = None;
-                self.just_opened = Some((self.editors[self.active_editor.unwrap()].id, Instant::now()));
+                self.just_opened = Some((new_id, Instant::now()));
             }
             Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
         }
@@ -1450,12 +1453,12 @@ impl App {
         let id = buf.id;
         let rev = buf.revision();
         let had_baseline = self.hl_cache.contains_key(&id);
-        let stale = match self.hl_cache.get(&id) {
-            Some((r, _)) => *r != rev,
-            None => true,
-        };
-        if !stale {
-            return &self.hl_cache.get(&id).unwrap().1;
+        let fresh = self.hl_cache.get(&id).is_some_and(|(r, _)| *r == rev);
+        if fresh {
+            // `.get(&id)` is guaranteed to hit: `fresh` is only true when the
+            // lookup just above found a matching entry, and nothing mutated
+            // `hl_cache` in between.
+            return self.hl_cache.get(&id).map(|(_, l)| l.as_slice()).unwrap_or(&[]);
         }
 
         // `buf`'s borrow ends after this line (everything it's used for is
@@ -1467,8 +1470,8 @@ impl App {
             // Just opened: no previous highlight to show meanwhile anyway, so
             // compute it inline once, exactly like before this change.
             let lines = syntax::highlight(&text, lang, &self.theme);
-            self.hl_cache.insert(id, (rev, lines));
-            return &self.hl_cache.get(&id).unwrap().1;
+            let entry = self.hl_cache.entry(id).or_insert((rev, lines));
+            return &entry.1;
         }
 
         // Build the fallback view: current text, but colour reused per-line
@@ -2216,7 +2219,10 @@ impl App {
             let hay: Vec<char> = buf.rope.chars().map(|c| c.to_ascii_lowercase()).collect();
             self.find_hay_cache = Some((id, rev, hay));
         }
-        let hay = &self.find_hay_cache.as_ref().unwrap().2;
+        // Always `Some` here: either it already was (not stale), or just set above.
+        let Some((_, _, hay)) = &self.find_hay_cache else {
+            return;
+        };
         if hay.len() < n {
             return;
         }
@@ -3552,6 +3558,15 @@ impl App {
                             self.notify(format!("Couldn't reload {name}: {e}"), ToastKind::Error)
                         }
                     }
+                    // `find.matches` holds char offsets into whichever buffer's
+                    // content was current when Find last searched — a reload can
+                    // shrink that content out from under them (an external tool
+                    // touched the file while Find was left open), and the find
+                    // highlight renders those offsets every frame regardless of
+                    // whether anyone's typing. Re-searching keeps them in bounds.
+                    if self.find.active {
+                        self.recompute_find();
+                    }
                 }
             }
         }
@@ -3580,6 +3595,11 @@ impl App {
             match self.editors[i].reload_from_disk() {
                 Ok(()) => self.notify(format!("Reloaded {name}"), ToastKind::Info),
                 Err(e) => self.notify(format!("Couldn't reload: {e}"), ToastKind::Error),
+            }
+            // See the comment in `poll_file_changes` — a reload can invalidate
+            // find.matches' cached char offsets.
+            if self.find.active {
+                self.recompute_find();
             }
         } else {
             // Keep mine: accept the disk state as the baseline so we don't re-ask.
@@ -5855,6 +5875,45 @@ mod tests {
         assert_eq!(app.editors[0].rope.to_string(), "rewritten by a command\n");
         assert!(!app.editors[0].modified, "auto-reloaded buffer stays clean");
         assert!(!app.prompt.active, "no prompt for a clean buffer");
+    }
+
+    /// Reproduces a real crash: Find left open with matches against a file
+    /// that then shrinks on disk (some other process touched it) — an
+    /// auto-reload must re-run the search rather than leave `find.matches`
+    /// pointing past the end of the now-shorter buffer, which panicked
+    /// ropey's `char_to_line` on the very next render (no keystroke needed —
+    /// the find highlight redraws every frame while it's open).
+    #[test]
+    fn external_reload_while_find_is_open_keeps_matches_in_bounds() {
+        let (_d, p, mut app) = open_one("needle needle needle\nneedle\nneedle\n");
+        app.find_open();
+        for c in "needle".chars() {
+            app.find_input(c);
+        }
+        assert_eq!(app.find.matches.len(), 5);
+        let stale_matches = app.find.matches.clone();
+
+        // The file shrinks drastically on disk (e.g. a formatter or another
+        // tool rewrote it) while Find is still showing the old matches.
+        std::fs::write(&p, "no matches here\n").unwrap();
+        app.recheck_files_soon();
+        app.poll_file_changes();
+
+        assert_eq!(app.editors[0].rope.to_string(), "no matches here\n");
+        let len = app.editors[0].rope.len_chars();
+        assert!(
+            stale_matches.iter().any(|&(_, e)| e > len),
+            "sanity check: the old matches really would be out of bounds now"
+        );
+        for &(s, e) in &app.find.matches {
+            assert!(s <= len && e <= len, "find.matches must be re-clamped to the reloaded content");
+        }
+        assert!(app.find.matches.is_empty(), "the new content has no \"needle\" left to match");
+
+        // Rendering must not panic on the (now-correct) match list.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
     }
 
     #[test]

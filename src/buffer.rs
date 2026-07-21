@@ -551,7 +551,7 @@ impl Buffer {
             .into_iter()
             .map(|(c, _)| c)
             .max_by_key(|c| c.cursor)
-            .unwrap();
+            .unwrap_or_else(|| self.this_caret());
         let row = self.rope.char_to_line(base.cursor);
         if row + 1 >= self.rope.len_lines() {
             return;
@@ -569,7 +569,7 @@ impl Buffer {
             .into_iter()
             .map(|(c, _)| c)
             .min_by_key(|c| c.cursor)
-            .unwrap();
+            .unwrap_or_else(|| self.this_caret());
         let row = self.rope.char_to_line(base.cursor);
         if row == 0 {
             return;
