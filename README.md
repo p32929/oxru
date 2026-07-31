@@ -1,0 +1,158 @@
+# Oxru
+
+A small, fast code editor that runs in your terminal — or in its own window — with **all of a project's terminals living in one place**.
+
+![Oxru — editor with the file tree](https://github.com/user-attachments/assets/456e5e68-6a79-4cdf-bb7f-5141cedf8d93)
+
+---
+
+## Why I built this
+
+Two reasons, honestly:
+
+1. **I wanted every terminal for a project in one place** — not a graveyard of OS terminal windows scattered across my desktop.
+2. **I was tired of how much RAM VS Code eats.** Every single time. So I figured: let me make something simple that does the 20% I actually use and stays light.
+
+That's it. It's not trying to be a full IDE. It's a blank screen, a file picker, tabs, and terminals — done well.
+
+## Why not just use VS Code or Neovim?
+
+Oxru isn't trying to beat either one. It's here for four things they didn't do for me:
+
+- **One window per project, not one per repo.** A project that's a backend + a bundler + a mobile app usually means a `run.sh` that fans out into a pile of OS terminal windows you then have to hunt through. Run the same script inside Oxru and those windows become **tabs inside Oxru** — `Alt+G` puts them all on screen at once, each labelled `folder · command`. Nothing in the script changes.
+- **Terminal *and* window, same binary.** VS Code is GUI-only, so over SSH or in a plain shell it's just not an option. Oxru runs in your terminal, or as a real window with `--gui`, with the same keys either way.
+- **Light, and you can turn it down further.** No Electron, and the status bar shows live memory and FPS so you can see what you're spending. Settings has a terminal FPS dial (`1 → 60`) that throttles only *unattended* output — a build log scrolling past stops costing CPU, while typing always redraws instantly.
+- **Nothing to configure.** Neovim is fast and light too, but getting it to the shape I wanted meant a plugin stack to maintain. Oxru is one binary with defaults I'm happy with. (If Neovim's already your happy place — genuinely, stay there.)
+
+## Why Rust
+
+I just wanted to see how far I could push Rust on a real, interactive, GUI-ish thing — and I genuinely like the language. This project was as much an excuse to write a lot of Rust as it was to scratch the itch above.
+
+---
+
+## Screenshots
+
+**Embedded terminals (tabs + auto-grid):**
+
+![Oxru — terminals](https://github.com/user-attachments/assets/64c622ca-66d1-4304-abea-1d85f34911c1)
+
+**Settings — live font size + theme color:**
+
+![Oxru — settings](https://github.com/user-attachments/assets/c2c16305-9b3f-483f-bb5d-92a96ac17fcc)
+
+**File picker:**
+
+![Oxru — file picker](https://github.com/user-attachments/assets/90da4f79-8f51-48ed-a099-11eacef3c66e)
+
+---
+
+## Install
+
+One line:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/p32929/oxru/master/install.sh | sh
+```
+
+This builds Oxru from source with Cargo and puts the `oxru` binary on your `PATH`. You'll need a [Rust toolchain](https://rustup.rs) (`cargo`) — the script tells you if it's missing.
+
+<details>
+<summary>Or build it yourself</summary>
+
+```sh
+git clone https://github.com/p32929/oxru
+cd oxru
+cargo install --path .
+```
+
+For a lean, terminal-only build with no windowing dependencies:
+
+```sh
+cargo install --path . --no-default-features
+```
+</details>
+
+---
+
+## Usage
+
+Open a project (defaults to the current directory):
+
+```sh
+oxru                        # open the current folder in the terminal
+oxru ~/code/myapp           # open a specific folder
+oxru --gui ~/code/myapp     # open it in a real window (bundled fonts, crisp glyphs)
+```
+
+You start on a blank screen with a few hints. Everything is keyboard-driven, and the windowed build also takes the mouse — click a tab to switch, click in the editor to drop the cursor.
+
+> **On the keys below.** They're written in `Ctrl` form; in the windowed build `⌘` works anywhere `Ctrl` does. In **terminal mode** every Oxru shortcut takes one extra key so it can't collide with your shell — `Ctrl+…` becomes `Ctrl+Alt+…`, `Alt+…` becomes `Alt+Shift+…`. **`F1`** shows the full list with the right combos for the mode you're in, and `Ctrl+Q` quits.
+
+### Files
+
+| Shortcut | Action |
+|---|---|
+| `Alt+F` | File picker — type to fuzzy-search, or browse the tree with the arrows |
+| `Ctrl+Shift+F` | Search in files — project-wide, powered by ripgrep's engine |
+| `Ctrl+O` / `Alt+O` | Open a folder · recent folders |
+
+In the picker: `Enter` open · `→ / ←` expand / collapse · `Tab` / `Shift+Tab` search into / out of a folder · `Ctrl+N` new file · `Alt+Shift+N` new folder · `Ctrl+R` rename · `Ctrl+D` delete · `Alt+R` reveal in Finder · `Alt+H` show / hide `node_modules`, build dirs… · `Esc` close.
+
+Open files get line numbers and tree-sitter syntax highlighting (Rust, JS, TS, Python, JSON, Go, C, HTML, CSS, Shell, TOML).
+
+### Editing & tabs
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+S` / `Ctrl+Shift+S` | Save · Save **all** |
+| `Ctrl+W` / `Ctrl+Shift+W` | Close tab · Close **all** (asks per unsaved file) |
+| `Ctrl+Shift+T` | Reopen the last closed tab |
+| `Ctrl+F` | Find in file (`Enter` / `Shift+Enter` next / previous) |
+| `Ctrl+\` | Split / unsplit the view |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `Ctrl+Shift+,` / `Ctrl+Shift+.` | Move the tab left / right |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste (system clipboard) |
+| `Ctrl+A` | Select all |
+| `Ctrl+D` | Add a caret at the next match (`Ctrl+Alt+↑/↓` above / below, `Esc` collapse) |
+| `Alt+Z` | Toggle word wrap (off by default — long lines scroll sideways) |
+| `Ctrl+Shift+C` / `Ctrl+Shift+R` | Copy the file's path · path relative to the project |
+| `Shift` + any move | Extend the selection |
+| `Alt+←/→` · `Ctrl+←/→` · `Ctrl+↑/↓` | By word · line start / end · document start / end |
+
+### Terminals
+
+| Shortcut | Action |
+|---|---|
+| `Alt+T` | Open / hide the terminal panel |
+| `Alt+N` / `Alt+W` | New terminal · close the current one |
+| `Alt+G` | Grid (all at once) vs. tabs — click a tile to focus it |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous terminal |
+| `⌘K` | Quick-switch by name (type to filter) — ⌘/Super, which the shell never needs |
+| `⌘1`–`⌘9` | Jump straight to terminal N |
+| `Ctrl+Shift+←/→` | Move the terminal left / right |
+| `Shift+PgUp/PgDn` (`fn+↑/↓`) | Scroll back through history |
+| `Alt+↑/↓` | Copy mode — free cursor, `Shift`+arrows to select, `Enter`/`y` copies |
+
+Terminals are named by their **folder · running command** (e.g. `server · node`, `web · vite`) so you can tell them apart at a glance.
+
+**The neat part:** if a script you run inside a terminal tries to open a *new* OS terminal window, Oxru catches it and opens a new tab **inside** instead. Run your project's `run.sh` that fans out into five windows and you get five tabs — no desktop clutter.
+
+### Settings
+
+- **`Ctrl+,`** — font size, terminal FPS, dialog size, word wrap, and the accent color. Changes apply live; the rest of the UI (status bar, selection) re-tints to match whatever accent you pick.
+- `↑ / ↓` switch sections · `← / →` change the value · `Esc` / `Enter` to close. Your choices are **saved** and restored next launch.
+
+The editor draws a **current-line highlight** and **indent guides** (the indent width is detected per file, so a 2-space file gets guides every 2 columns). Both are on by default; turn either off with `[editor] current_line = false` / `indent_guides = false`.
+
+Prefer a file? Drop a `config.toml` at `~/.config/oxru/config.toml` (global) or `<project>/.oxru/config.toml` (per-project, wins over global). See [`examples/config.toml`](examples/config.toml).
+
+---
+
+## Status
+
+Still under active development, but stable enough to daily-drive — it's what I use for pretty much everything now, and I keep updating it whenever I feel like it, so expect things to move. Intentionally small: the handful of things I reach for every day, done well, rather than everything. Issues and ideas welcome.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Do whatever you want with it.
