@@ -5,9 +5,9 @@
 # Usage:
 #   ./run-local.sh                 # TUI, opens the current folder
 #   ./run-local.sh .               # same, explicit
-#   ./run-local.sh --gui .         # GUI window, current folder
+#   ./run-local.sh .               # GUI window, current folder (the default)
 #   ./run-local.sh ~/some/project  # TUI, opens that folder
-#   ./run-local.sh --gui ~/proj    # GUI, opens that folder
+#   ./run-local.sh --term ~/proj   # inside this terminal instead
 #
 # Everything after the script name is forwarded straight to the oxru binary,
 # so any flag oxru understands works here too. Fast iteration:

@@ -2,8 +2,8 @@
 //!
 //! The UI is intentionally minimal: a blank screen and a single file dialog
 //! (open with `Option+F`) for searching, opening, and managing files; `Ctrl+F`
-//! finds within the open file. It can run in the terminal or, with `--gui`, in
-//! its own window.
+//! finds within the open file. It opens in its own window by default; `--term`
+//! runs it inside the host terminal instead.
 
 mod app;
 mod buffer;
@@ -27,6 +27,7 @@ mod syntax;
 mod termbridge;
 mod terminalpane;
 mod theme;
+mod todo;
 mod ui;
 mod wrap;
 
@@ -59,9 +60,7 @@ fn main() -> Result<()> {
         print_usage();
         return Ok(());
     }
-    let want_gui = args
-        .iter()
-        .any(|a| matches!(a.as_str(), "--gui" | "-w" | "--windowed"));
+    let want_gui = wants_gui(&args);
 
     // `oxru --gui .` launched from an interactive shell would otherwise sit in
     // the foreground for as long as the window stays open, blocking that shell
@@ -140,6 +139,65 @@ fn main() -> Result<()> {
     result
 }
 
+/// Whether to open a window. **Windowed is the default**; `--term` opts into
+/// running inside the host terminal, and `--gui` stays accepted so existing
+/// commands and scripts keep working.
+///
+/// An explicit flag always wins — if both appear, the last one on the command
+/// line does, so `oxru --term --gui` reads the way you'd say it aloud.
+fn wants_gui(args: &[String]) -> bool {
+    resolve_mode(explicit_mode(args), cfg!(feature = "gui"), headless_session())
+}
+
+/// The mode named on the command line, if either was. The *last* flag wins, so
+/// `oxru --term --gui` reads the way you'd say it aloud.
+fn explicit_mode(args: &[String]) -> Option<bool> {
+    args.iter().rev().find_map(|a| match a.as_str() {
+        "--gui" | "-w" | "--windowed" => Some(true),
+        "--term" | "--terminal" | "--tui" | "-t" => Some(false),
+        _ => None,
+    })
+}
+
+/// Decide the mode. Split from the environment probing so the policy itself is
+/// testable without setting process-wide variables.
+fn resolve_mode(explicit: Option<bool>, gui_supported: bool, headless: bool) -> bool {
+    match explicit {
+        // An explicit `--gui` is honoured even headless: it can only fail
+        // loudly, and second-guessing the user is worse than letting them see
+        // why it didn't work. A build with no window support is the one case
+        // that can't be overridden — there is no window to open.
+        Some(choice) => choice && gui_supported,
+        // A build compiled without the `gui` feature has no window to open, so
+        // the default has to be the terminal or every bare `oxru` would fail.
+        None if !gui_supported => false,
+        // Nothing to display to: over SSH (or a Linux session with no display
+        // server) a window can't appear, and because the windowed path detaches
+        // itself the user would get *silence* rather than an error. Fall back
+        // rather than vanish.
+        None if headless => false,
+        None => true,
+    }
+}
+
+/// Whether this process has no way to put a window on screen.
+fn headless_session() -> bool {
+    let ssh = std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some();
+    if ssh {
+        return true;
+    }
+    // macOS always has a window server for a local session; X11/Wayland don't.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return std::env::var_os("DISPLAY").is_none()
+            && std::env::var_os("WAYLAND_DISPLAY").is_none();
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    false
+}
+
 /// Respawn this binary as a session-detached child (like `code .` does) and
 /// return immediately. `setsid()` puts the child in a brand-new session with
 /// no controlling terminal, so a SIGHUP from the launching terminal closing
@@ -173,12 +231,16 @@ fn relaunch_gui_detached(args: &[String]) -> Result<()> {
 
 fn print_usage() {
     println!(
-        "Oxru — a hackable, TUI-only code editor\n\n\
+        "Oxru — a hackable code editor for the terminal and the desktop\n\n\
          USAGE:\n    oxru [OPTIONS] [PROJECT_DIR]\n\n\
+         Opens in its own window by default.\n\n\
          OPTIONS:\n\
-         \x20   -w, --windowed, --gui   Open in a window (GUI) instead of the terminal\n\
+         \x20   -t, --term, --terminal  Run inside this terminal instead of a window\n\
+         \x20   -w, --gui, --windowed   Open in a window (the default; forces it\n\
+         \x20                           even over SSH)\n\
          \x20   -h, --help              Show this help\n\n\
-         If PROJECT_DIR is omitted, the current directory is opened."
+         Over SSH, or on a build without window support, the terminal is used\n\
+         automatically. If PROJECT_DIR is omitted, the welcome screen opens."
     );
 }
 
@@ -345,4 +407,59 @@ fn install_panic_hook() {
         );
         original(info);
     }));
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn windowed_is_the_default() {
+        assert_eq!(explicit_mode(&args(&["."])), None, "a bare path names no mode");
+        assert!(resolve_mode(None, true, false), "no flag opens a window");
+    }
+
+    #[test]
+    fn term_opts_into_the_terminal() {
+        for flag in ["--term", "--terminal", "--tui", "-t"] {
+            assert_eq!(explicit_mode(&args(&[flag, "."])), Some(false), "{flag}");
+            assert!(!resolve_mode(Some(false), true, false), "{flag}");
+        }
+    }
+
+    #[test]
+    fn gui_flags_still_work() {
+        // Existing commands, scripts and muscle memory must keep working.
+        for flag in ["--gui", "--windowed", "-w"] {
+            assert_eq!(explicit_mode(&args(&[flag, "."])), Some(true), "{flag}");
+        }
+    }
+
+    #[test]
+    fn the_last_flag_wins() {
+        assert_eq!(explicit_mode(&args(&["--term", "--gui"])), Some(true));
+        assert_eq!(explicit_mode(&args(&["--gui", "--term"])), Some(false));
+    }
+
+    #[test]
+    fn a_headless_session_falls_back_to_the_terminal() {
+        // Over SSH the windowed path detaches itself, so without this the user
+        // would get silence rather than a window or an error.
+        assert!(!resolve_mode(None, true, true), "no display: use the terminal");
+        // …but an explicit --gui is still honoured, so it can fail visibly
+        // rather than being silently overridden.
+        assert!(resolve_mode(Some(true), true, true), "--gui is not second-guessed");
+    }
+
+    #[test]
+    fn a_build_without_window_support_always_uses_the_terminal() {
+        // Otherwise `cargo install --no-default-features` would produce a
+        // binary where every bare `oxru` fails.
+        assert!(!resolve_mode(None, false, false));
+        assert!(!resolve_mode(Some(true), false, false), "even with --gui: there is no window");
+    }
 }

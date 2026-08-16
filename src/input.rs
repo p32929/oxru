@@ -8,43 +8,40 @@ use crate::app::App;
 use crate::prompt::PromptKind;
 
 /// Ctrl(⌘) / Alt gating for Oxru's own shortcuts (editor, dialogs, prompts —
-/// NOT the embedded terminal, which deliberately keeps its shell-emulation
-/// chords like Ctrl+←/→ word-jump and Cmd+C copy 2-key to match how a real
-/// terminal app behaves).
+/// NOT the embedded terminal, which reads its own raw modifiers so the shell
+/// keeps every chord a real terminal app would get).
 ///
-/// In GUI mode, a 2-key Ctrl/⌘ or Alt combo is unambiguous — Oxru's own
-/// window captures every keypress directly. In TUI mode, Oxru runs *inside*
-/// a host terminal emulator, so a bare 2-key combo can collide with
-/// something the host (or a shell running inside it) already reserves.
-/// There, every shortcut needs a 3rd key: Ctrl-based ones additionally
-/// require Alt (so `Ctrl+S` becomes `Ctrl+Alt+S`, and an already-Shifted
-/// variant like `Ctrl+Shift+S` "save all" becomes `Ctrl+Alt+Shift+S`,
-/// keeping the two distinct); Alt-based ones additionally require Shift
-/// instead (`Alt+T` becomes `Alt+Shift+T`) — a different extra key so the
-/// two families can never land on the same combo for the same letter (e.g.
-/// `Ctrl+F` "find" vs `Alt+F` "open files" become `Ctrl+Alt+F` vs
-/// `Alt+Shift+F`, not both `Ctrl+Alt+F`).
-fn shortcut_mods(app: &App, key: &KeyEvent) -> (bool, bool, bool) {
-    let alt_physical = key.modifiers.contains(KeyModifiers::ALT);
+/// **The same combo does the same thing in both modes.** TUI mode used to
+/// require a 3rd key on every shortcut (`Ctrl+S` → `Ctrl+Alt+S`, `Alt+T` →
+/// `Alt+Shift+T`) on the theory that a bare 2-key combo could collide with
+/// something the host terminal reserves. The cost of that was one editor with
+/// two different keymaps: muscle memory built in the window didn't transfer to
+/// the terminal, and every hint row, cheat-sheet entry and doc line had to be
+/// rendered twice. One keymap is worth more than dodging the handful of combos
+/// a host terminal might intercept — and where a host *does* swallow one, it
+/// swallows it before Oxru ever sees the key, so a different binding here
+/// wouldn't have rescued it anyway.
+fn shortcut_mods(key: &KeyEvent) -> (bool, bool, bool) {
+    let alt_held = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     // On macOS the window uses Command (⌘ / Super) for shortcuts; treat it as
     // Ctrl so every Ctrl binding below also fires on ⌘ — a native Mac feel while
     // the terminal-only build keeps working on Ctrl. (The embedded terminal reads
     // its own raw modifiers, so this fold doesn't reach the shell.)
-    let ctrl_physical =
+    let ctrl_held =
         key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER);
-    let ctrl = ctrl_physical && (app.gui || alt_physical);
-    let alt = if app.gui {
-        alt_physical
-    } else {
-        alt_physical && shift && !ctrl_physical
-    };
-    (ctrl, alt, shift)
+    // The two families are mutually exclusive: holding both means neither
+    // fires. Without this, `Ctrl+Alt+A` would still reach the plain `Ctrl+A`
+    // arm — a second combo for the same action, which is exactly what the
+    // old per-mode keymap left behind. The one binding that genuinely wants
+    // both modifiers (add-caret) is matched on the raw key state in
+    // [`handle_key`], before this ever applies.
+    (ctrl_held && !alt_held, alt_held && !ctrl_held, shift)
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     use crate::app::Dialog;
-    let (ctrl, alt, shift) = shortcut_mods(app, &key);
+    let (ctrl, alt, shift) = shortcut_mods(&key);
 
     // The name prompt / delete confirmation is always top-most and modal.
     if app.prompt.active {
@@ -58,10 +55,40 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Add-caret is the only binding that deliberately holds Ctrl *and* Alt, so
+    // it reads the raw key state — `shortcut_mods` has already cancelled both
+    // families out by this point. Everything else in that shape is swallowed
+    // rather than allowed to fall through: `Ctrl+Alt+A` must do nothing at all,
+    // not select-all (the old alias) and not type an "a".
+    let raw_ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER);
+    let raw_alt = key.modifiers.contains(KeyModifiers::ALT);
+    if raw_ctrl && raw_alt && !matches!(app.top_dialog(), Some(Dialog::Terminal)) {
+        if app.top_dialog().is_none() && !app.find.active {
+            match key.code {
+                KeyCode::Up => {
+                    app.add_caret_above();
+                    return;
+                }
+                KeyCode::Down => {
+                    app.add_caret_below();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+
     // App-level chords that work from ANY context — the editor, the terminal,
     // or on top of another dialog. The dialog ones just raise it if it's
     // already open (no dup); word wrap is a plain toggle either way.
-    if alt {
+    //
+    // `!shift` matters: `Alt+Shift+T` was the old terminal-mode combo for
+    // "open terminal", and leaving it firing here would keep exactly the
+    // duplicate binding this change is removing. (`Alt+Shift+N` for new-folder
+    // is a real binding, but it lives in the Files dialog, not this block.)
+    if alt && !shift {
         match key.code {
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 app.toggle_terminal_modal();
@@ -78,6 +105,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             // Word wrap (⌥Z, matching VSCode's Alt+Z).
             KeyCode::Char('z') | KeyCode::Char('Z') => {
                 app.toggle_word_wrap();
+                return;
+            }
+            // The global to-do list.
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                app.open_todos_dialog();
+                return;
+            }
+            // Clipboard history.
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                app.open_clipboard_dialog();
                 return;
             }
             _ => {}
@@ -123,16 +160,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         Some(Dialog::Files) => handle_file_dialog(app, key, ctrl, alt, shift),
         Some(Dialog::Recent) => handle_recent_dialog(app, key),
         Some(Dialog::Settings) => handle_settings_dialog(app, key),
-        // The embedded terminal is exempt from the TUI 3-key rule — it
-        // deliberately mirrors a real terminal app's shell-emulation chords
-        // (Ctrl+←/→ word-jump, Option+↑/↓ copy mode, …), so it always wants
-        // the raw physical Alt, not `shortcut_mods`'s TUI-gated version.
+        // The embedded terminal reads the raw physical Alt rather than
+        // `shortcut_mods`'s folded view: it mirrors a real terminal app's
+        // shell-emulation chords (Ctrl+←/→ word-jump, Option+↑/↓ copy mode,
+        // …), which must reach the shell exactly as pressed.
         Some(Dialog::Terminal) => {
             handle_terminal_modal(app, key, key.modifiers.contains(KeyModifiers::ALT))
         }
         Some(Dialog::TerminalPicker) => handle_terminal_picker_dialog(app, key),
         Some(Dialog::Help) => handle_help_dialog(app, key),
         Some(Dialog::SearchFiles) => handle_search_files_dialog(app, key, ctrl, alt, shift),
+        Some(Dialog::Todos) => handle_todos_dialog(app, key, ctrl, alt, shift),
+        Some(Dialog::Clipboard) => handle_clipboard_dialog(app, key, ctrl),
         None => handle_editor_context(app, key, ctrl, alt, shift),
     }
 }
@@ -331,6 +370,19 @@ fn handle_prompt(app: &mut App, key: KeyEvent, ctrl: bool) {
             }
             return;
         }
+        // A link clicked in a terminal: Enter/Y opens it, Esc/N doesn't.
+        Some(PromptKind::OpenUrl) => {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.open_url_answer(true)
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    app.open_url_answer(false)
+                }
+                _ => {}
+            }
+            return;
+        }
         // Quit flow: running terminal — close & quit / close all / cancel.
         Some(PromptKind::QuitTerminal) => {
             match key.code {
@@ -344,7 +396,7 @@ fn handle_prompt(app: &mut App, key: KeyEvent, ctrl: bool) {
         _ => {}
     }
     use crate::editline as el;
-    let (_, alt, shift) = shortcut_mods(app, &key);
+    let (_, alt, shift) = shortcut_mods(&key);
     macro_rules! p {
         () => {
             (&app.prompt.input, &mut app.prompt.cursor, &mut app.prompt.anchor)
@@ -497,7 +549,7 @@ fn handle_search_files_dialog(app: &mut App, key: KeyEvent, ctrl: bool, alt: boo
     }
 }
 
-/// The terminal quick-switcher (⌘K): type to filter, ↑↓ to move, Enter jumps.
+/// The terminal quick-switcher (⌥K): type to filter, ↑↓ to move, Enter jumps.
 fn handle_terminal_picker_dialog(app: &mut App, key: KeyEvent) {
     let no_mods = !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SUPER);
@@ -539,6 +591,70 @@ fn handle_settings_dialog(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// The to-do list (⌥D). Typing goes to the "add a task" line — the list is
+/// short enough that adding matters more than filtering — and the row keys act
+/// on the highlighted task.
+fn handle_todos_dialog(app: &mut App, key: KeyEvent, ctrl: bool, alt: bool, shift: bool) {
+    use crate::editline as el;
+    macro_rules! q {
+        () => {
+            (&app.todo_input, &mut app.todo_input_cursor, &mut app.todo_input_anchor)
+        };
+    }
+    match key.code {
+        KeyCode::Esc => app.close_top_dialog(),
+        KeyCode::Up => app.todo_move(-1),
+        KeyCode::Down => app.todo_move(1),
+        KeyCode::Enter => app.todo_add(),
+        // Space toggles the highlighted task — but only when it isn't being
+        // typed into the input line, where it's just a space.
+        KeyCode::Char(' ') if app.todo_input.is_empty() => app.todo_toggle(),
+        // ⌃E hands the raw file to the real editor.
+        KeyCode::Char('e') | KeyCode::Char('E') if ctrl => app.todo_edit_as_file(),
+        KeyCode::Char('d') | KeyCode::Char('D') if ctrl && shift => app.todo_clear_done(),
+        KeyCode::Char('d') | KeyCode::Char('D') if ctrl => app.todo_remove(),
+        // Input-line editing, same chords as every other dialog's text field.
+        KeyCode::Left if alt => { let (t, c, a) = q!(); el::word_left(t, c, a, shift) }
+        KeyCode::Right if alt => { let (t, c, a) = q!(); el::word_right(t, c, a, shift) }
+        KeyCode::Left if ctrl => { let (t, c, a) = q!(); el::home(t, c, a, shift) }
+        KeyCode::Right if ctrl => { let (t, c, a) = q!(); el::end(t, c, a, shift) }
+        KeyCode::Left => { let (t, c, a) = q!(); el::left(t, c, a, shift) }
+        KeyCode::Right => { let (t, c, a) = q!(); el::right(t, c, a, shift) }
+        KeyCode::Home => { let (t, c, a) = q!(); el::home(t, c, a, shift) }
+        KeyCode::End => { let (t, c, a) = q!(); el::end(t, c, a, shift) }
+        KeyCode::Backspace if alt => {
+            el::delete_word_left(&mut app.todo_input, &mut app.todo_input_cursor, &mut app.todo_input_anchor)
+        }
+        KeyCode::Backspace => {
+            el::backspace(&mut app.todo_input, &mut app.todo_input_cursor, &mut app.todo_input_anchor)
+        }
+        KeyCode::Delete => {
+            el::delete_fwd(&mut app.todo_input, &mut app.todo_input_cursor, &mut app.todo_input_anchor)
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') if ctrl => {
+            el::select_all(&app.todo_input, &mut app.todo_input_cursor, &mut app.todo_input_anchor)
+        }
+        // A multi-line paste becomes one task per line — see `App::todo_paste`.
+        KeyCode::Char('v') | KeyCode::Char('V') if ctrl => app.todo_paste(),
+        KeyCode::Char(c) if !ctrl && !alt => {
+            el::insert(&mut app.todo_input, &mut app.todo_input_cursor, &mut app.todo_input_anchor, c)
+        }
+        _ => {}
+    }
+}
+
+/// Clipboard history (⌥V): pick an entry, Enter pastes it where you were.
+fn handle_clipboard_dialog(app: &mut App, key: KeyEvent, ctrl: bool) {
+    match key.code {
+        KeyCode::Esc => app.close_top_dialog(),
+        KeyCode::Up => app.clip_move(-1),
+        KeyCode::Down => app.clip_move(1),
+        KeyCode::Enter => app.clip_paste_selected(),
+        KeyCode::Char('d') | KeyCode::Char('D') if ctrl => app.clip_clear(),
+        _ => {}
+    }
+}
+
 /// No dialog open: editor Control/⌘ shortcuts and basic editing.
 fn handle_editor_context(app: &mut App, key: KeyEvent, ctrl: bool, alt: bool, shift: bool) {
     // Esc collapses multiple carets back to one (no-op otherwise).
@@ -548,10 +664,9 @@ fn handle_editor_context(app: &mut App, key: KeyEvent, ctrl: bool, alt: bool, sh
     }
     if ctrl {
         match key.code {
-            // ⌘⌥↑/↓ add a caret above / below for column editing (checked before
-            // the plain ⌘↑/↓ document-jump below).
-            KeyCode::Up if alt => app.add_caret_above(),
-            KeyCode::Down if alt => app.add_caret_below(),
+            // ⌘⌥↑/↓ (add caret above / below) is handled in `handle_key` on the
+            // raw modifiers — Ctrl and Alt cancel each other out by the time
+            // this block runs.
             // ⌘D selects the next occurrence of the word/selection, multi-cursor.
             KeyCode::Char('d') | KeyCode::Char('D') => app.add_next_occurrence(),
             // ⌘/Ctrl navigation: line start/end, document start/end, and
@@ -693,24 +808,17 @@ fn handle_terminal_modal(app: &mut App, key: KeyEvent, alt: bool) {
         return;
     }
 
-    // Cmd+W closes the focused terminal (mirrors ⌥W). Uses ⌘, which the shell
-    // never needs, so it won't clobber a running program.
-    if sup && matches!(key.code, KeyCode::Char('w') | KeyCode::Char('W')) {
-        app.close_terminal();
-        return;
-    }
-
-    // Cmd+K opens the quick-switch palette — jump straight to a terminal by
-    // name instead of stepping through Ctrl+Tab. Same "⌘, the shell never
-    // needs" reasoning as ⌘W above.
-    if sup && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K')) {
-        app.open_terminal_picker();
-        return;
-    }
-
-    // Cmd+1..9 jumps straight to that terminal by tab position — the numbered
-    // counterpart to ⌘K's by-name jump, mirroring browser/VSCode tab shortcuts.
-    if sup {
+    // Terminal management lives on Alt, the whole family together (⌥N new,
+    // ⌥W close, ⌥G grid, ⌥K quick-switch, ⌥1-9 jump). These were on ⌘ — which
+    // reads nicely on a Mac but is never delivered to a program running inside
+    // a terminal emulator, so quick-switch and jump-to-N simply did not exist
+    // in the TUI build, and ⌘W was a second way to do ⌥W's job. One binding
+    // each, reachable in both.
+    if alt {
+        if matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K')) {
+            app.open_terminal_picker();
+            return;
+        }
         if let KeyCode::Char(c @ '1'..='9') = key.code {
             app.jump_to_terminal(c as usize - '0' as usize);
             return;
@@ -1064,74 +1172,222 @@ mod tests {
         assert_eq!(app.top_dialog(), None);
     }
 
-    /// The actual point of `shortcut_mods`: a real terminal emulator can
-    /// intercept or reserve plain 2-key Ctrl/Cmd chords before Oxru's own
-    /// TUI event loop ever sees them, so every Oxru shortcut needs a 3rd key
-    /// there. GUI mode captures keys directly with no such interference, so
-    /// it keeps the simple 2-key combo.
+    /// One keymap, both modes: the same combo must do the same thing whether
+    /// Oxru is drawing its own window or running inside a host terminal. TUI
+    /// mode used to demand a 3rd key on every shortcut, which meant muscle
+    /// memory built in one mode simply didn't work in the other.
     #[test]
-    fn tui_mode_requires_alt_as_a_third_key_for_ctrl_shortcuts() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("a.txt");
-        std::fs::write(&f, "hello world").unwrap();
-        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
-        assert!(!app.gui, "defaults to TUI mode");
-        app.open_path(&f);
+    fn ctrl_shortcuts_fire_on_the_same_combo_in_both_modes() {
+        for gui in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join("a.txt");
+            std::fs::write(&f, "hello world").unwrap();
+            let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+            app.gui = gui;
+            app.open_path(&f);
 
-        // Bare Ctrl+A does nothing in TUI mode — it's missing the 3rd key.
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert!(app.active_buffer().unwrap().selection().is_none(), "Ctrl+A alone is not enough");
-
-        // Ctrl+Alt+A is the TUI-mode equivalent of GUI's Ctrl+A.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL | KeyModifiers::ALT),
-        );
-        assert!(app.active_buffer().unwrap().selection().is_some(), "Ctrl+Alt+A selects all");
+            handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+            assert!(
+                app.active_buffer().unwrap().selection().is_some(),
+                "plain Ctrl+A must select all (gui = {gui})"
+            );
+        }
     }
 
     #[test]
-    fn gui_mode_keeps_the_plain_two_key_ctrl_shortcut() {
+    fn alt_shortcuts_fire_on_the_same_combo_in_both_modes() {
+        for gui in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+            app.gui = gui;
+
+            handle_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
+            assert!(app.terminal_modal, "plain Alt+T must open the terminal (gui = {gui})");
+        }
+    }
+
+    /// One action, one combo. The old terminal-mode aliases (`Ctrl+Alt+…` for
+    /// a Ctrl binding, `Alt+Shift+…` for an Alt binding) must be dead — a
+    /// second combo reaching the same action is the same "two keymaps"
+    /// problem, just hidden.
+    #[test]
+    fn the_old_three_key_aliases_no_longer_fire() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("a.txt");
         std::fs::write(&f, "hello world").unwrap();
+
+        // Alt+Shift+T was terminal-mode's "open terminal".
         let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
-        app.gui = true;
-        app.open_path(&f);
-
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert!(
-            app.active_buffer().unwrap().selection().is_some(),
-            "GUI mode fires on the plain 2-key combo"
-        );
-    }
-
-    #[test]
-    fn tui_mode_requires_shift_as_a_third_key_for_alt_shortcuts() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
-        assert!(!app.gui, "defaults to TUI mode");
-
-        // Bare Alt+T does nothing in TUI mode — missing the 3rd key.
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
-        assert!(!app.terminal_modal, "Alt+T alone is not enough");
-
-        // Alt+Shift+T is the TUI-mode equivalent of GUI's Alt+T.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT | KeyModifiers::SHIFT),
         );
-        assert!(app.terminal_modal, "Alt+Shift+T opens the terminal");
+        assert!(!app.terminal_modal, "Alt+Shift+T must no longer open the terminal");
+
+        // Ctrl+Alt+A was terminal-mode's "select all".
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.open_path(&f);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL | KeyModifiers::ALT),
+        );
+        assert!(
+            app.active_buffer().unwrap().selection().is_none(),
+            "Ctrl+Alt+A must no longer select all"
+        );
+        // …and must not fall through to the text-insert path either.
+        assert_eq!(
+            app.active_buffer().unwrap().rope.to_string(),
+            "hello world",
+            "a dead combo must type nothing"
+        );
+    }
+
+    /// The other multi-modifier binding: Alt+Shift+N in the Files dialog. Alt
+    /// keeps working alongside Shift — only the *global* Alt chords require
+    /// Shift to be absent, since that's where the old alias lived.
+    #[test]
+    fn alt_d_opens_the_todo_list_and_alt_v_the_clipboard() {
+        use crate::app::Dialog;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        assert_eq!(app.top_dialog(), Some(Dialog::Todos), "⌥D opens the to-do list");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        assert_eq!(app.top_dialog(), Some(Dialog::Clipboard), "⌥V opens the history");
+    }
+
+    /// Typing goes to the add-line, Enter commits, Space toggles.
+    #[test]
+    fn typing_then_enter_adds_a_task_and_space_toggles_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        // Point the store at the scratch dir so this exercises the real
+        // write-through path without touching the machine's own list.
+        app.todos_path = Some(dir.path().join("todos.md"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        for c in "ship it".chars() {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.todo_input, "ship it");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(crate::todo::counts(&app.todos), (0, 1));
+        assert!(app.todo_input.is_empty(), "the input clears after adding");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(crate::todo::counts(&app.todos), (1, 1), "Space checks it off");
+
+        // Every change is on disk immediately, at the injected path only.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("todos.md")).unwrap(),
+            "- [x] ship it\n"
+        );
+    }
+
+    /// The reported bug: pasting a list into the to-do input appeared to do
+    /// nothing, because the dialog had no paste binding at all.
+    #[test]
+    fn pasting_a_list_into_the_todo_input_adds_one_task_per_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.todos_path = Some(dir.path().join("todos.md"));
+        app.open_todos_dialog();
+        app.set_clipboard(
+            "- search a word in all files\n- copying multiples in clipboard?\nplain line\n".into(),
+        );
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+
+        assert_eq!(crate::todo::counts(&app.todos), (0, 3), "one task per line");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("todos.md")).unwrap(),
+            "- [ ] search a word in all files\n- [ ] copying multiples in clipboard?\n- [ ] plain line\n",
+            "bullets stripped, all normalised, written straight through"
+        );
     }
 
     #[test]
-    fn gui_mode_keeps_the_plain_two_key_alt_shortcut() {
+    fn pasting_one_line_goes_into_the_input_not_the_list() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
-        app.gui = true;
+        app.todos_path = Some(dir.path().join("todos.md"));
+        app.open_todos_dialog();
+        app.set_clipboard("refactor the parser".into());
 
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
-        assert!(app.terminal_modal, "GUI mode fires on the plain 2-key combo");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert_eq!(app.todo_input, "refactor the parser", "single line is editable first");
+        assert_eq!(crate::todo::counts(&app.todos), (0, 0), "nothing committed yet");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(crate::todo::counts(&app.todos), (0, 1));
+    }
+
+    #[test]
+    fn a_multiline_paste_keeps_whatever_was_half_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.todos_path = Some(dir.path().join("todos.md"));
+        app.open_todos_dialog();
+        for c in "typed first".chars() {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.set_clipboard("one\ntwo\n".into());
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+
+        let text = std::fs::read_to_string(dir.path().join("todos.md")).unwrap();
+        assert_eq!(text, "- [ ] typed first\n- [ ] one\n- [ ] two\n", "nothing dropped");
+    }
+
+    #[test]
+    fn alt_shift_n_still_starts_a_new_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.open_file_dialog();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+        );
+        assert!(app.prompt.active, "⇧⌥N opens the new-folder prompt");
+        assert!(!app.terminal_modal, "and must not have hit the global Alt block");
+    }
+
+    /// The one binding that legitimately holds Ctrl and Alt together. It has
+    /// to keep working even though the two families now cancel out.
+    #[test]
+    fn ctrl_alt_arrows_still_add_a_caret() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.open_path(&f);
+        assert_eq!(app.active_buffer().unwrap().caret_count(), 1);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL | KeyModifiers::ALT),
+        );
+        assert_eq!(app.active_buffer().unwrap().caret_count(), 2, "⌘⌥↓ adds a caret");
+    }
+
+    /// Shift+Alt+arrows extends the selection by word — an Alt binding that
+    /// genuinely wants Shift, so the alias removal must not catch it.
+    #[test]
+    fn shift_alt_arrows_still_extend_the_selection_by_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "hello world").unwrap();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.open_path(&f);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT),
+        );
+        assert!(
+            app.active_buffer().unwrap().selection().is_some(),
+            "⇧⌥→ still selects a word"
+        );
     }
 
     /// The embedded terminal's own key handling deliberately stays exempt
@@ -1246,28 +1502,21 @@ mod tests {
     }
 
     #[test]
-    fn alt_z_needs_a_third_key_in_tui_mode() {
+    fn alt_z_toggles_word_wrap_in_terminal_mode_too() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(dir.path().to_path_buf())).unwrap(); // gui = false by default
         app.config_path = Some(dir.path().join("scratch-config.toml"));
         handle_key(&mut app, KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT));
-        assert!(!app.word_wrap, "the bare 2-key combo must not fire in TUI mode");
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT | KeyModifiers::SHIFT));
-        assert!(app.word_wrap);
+        assert!(app.word_wrap, "the same Alt+Z fires in the terminal build");
     }
 
     #[test]
-    fn ctrl_shift_f_needs_a_third_key_in_tui_mode() {
+    fn ctrl_shift_f_opens_search_files_in_terminal_mode_too() {
         use crate::app::Dialog;
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(dir.path().to_path_buf())).unwrap(); // gui = false by default
         handle_key(&mut app, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
-        assert_eq!(app.top_dialog(), None, "the bare 2-key combo must not fire in TUI mode");
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT),
-        );
-        assert_eq!(app.top_dialog(), Some(Dialog::SearchFiles));
+        assert_eq!(app.top_dialog(), Some(Dialog::SearchFiles), "same combo, both modes");
     }
 
     #[test]
@@ -1319,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_k_opens_the_terminal_picker_and_typing_filters_it() {
+    fn alt_k_opens_the_terminal_picker_and_typing_filters_it() {
         // Fixed-name root: the picker fuzzy-matches "folder · command", so a
         // random tempdir name containing the filtered digit makes both
         // terminals match and fails this intermittently.
@@ -1331,7 +1580,7 @@ mod tests {
         app.new_terminal(); // term 1, "<folder> 2"
         assert_eq!(app.top_dialog(), Some(crate::app::Dialog::Terminal));
 
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
         assert_eq!(app.top_dialog(), Some(crate::app::Dialog::TerminalPicker));
 
         // Typing routes to the picker's query, not the shell underneath.
@@ -1352,14 +1601,14 @@ mod tests {
         app.new_terminal(); // term 2, now active
         assert_eq!(app.active_terminal, 2);
 
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SUPER));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
         assert_eq!(app.active_terminal, 0, "⌘1 jumps to the first terminal");
 
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('3'), KeyModifiers::SUPER));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
         assert_eq!(app.active_terminal, 2, "⌘3 jumps to the third terminal");
 
         // Past the last tab: no-op, doesn't panic or wrap.
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('9'), KeyModifiers::SUPER));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT));
         assert_eq!(app.active_terminal, 2, "⌘9 with only 3 terminals does nothing");
     }
 

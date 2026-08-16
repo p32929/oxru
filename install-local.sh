@@ -199,6 +199,6 @@ fi
 
 echo
 green "Done — Oxru is up to date."
-echo "Run it:  oxru --gui ."
+echo "Run it:  oxru .          (a window; add --term to stay in this terminal)"
 [ "$(uname -s)" = "Darwin" ] && echo "Or open it from Launchpad / Spotlight as \"Oxru\"."
 exit 0

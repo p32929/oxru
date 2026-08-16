@@ -20,7 +20,7 @@ That's it. It's not trying to be a full IDE. It's a blank screen, a file picker,
 Oxru isn't trying to beat either one. It's here for four things they didn't do for me:
 
 - **One window per project, not one per repo.** A project that's a backend + a bundler + a mobile app usually means a `run.sh` that fans out into a pile of OS terminal windows you then have to hunt through. Run the same script inside Oxru and those windows become **tabs inside Oxru** — `Alt+G` puts them all on screen at once, each labelled `folder · command`. Nothing in the script changes.
-- **Terminal *and* window, same binary.** VS Code is GUI-only, so over SSH or in a plain shell it's just not an option. Oxru runs in your terminal, or as a real window with `--gui`, with the same keys either way.
+- **Terminal *and* window, same binary.** VS Code is GUI-only, so over SSH or in a plain shell it's just not an option. Oxru opens as a real window by default and runs inside your terminal with `--term`, with the same keys either way.
 - **Light, and you can turn it down further.** No Electron, and the status bar shows live memory and FPS so you can see what you're spending. Settings has a terminal FPS dial (`1 → 60`) that throttles only *unattended* output — a build log scrolling past stops costing CPU, while typing always redraws instantly.
 - **Nothing to configure.** Neovim is fast and light too, but getting it to the shape I wanted meant a plugin stack to maintain. Oxru is one binary with defaults I'm happy with. (If Neovim's already your happy place — genuinely, stay there.)
 
@@ -79,14 +79,16 @@ cargo install --path . --no-default-features
 Open a project (defaults to the current directory):
 
 ```sh
-oxru                        # open the current folder in the terminal
-oxru ~/code/myapp           # open a specific folder
-oxru --gui ~/code/myapp     # open it in a real window (bundled fonts, crisp glyphs)
+oxru                        # welcome screen, in a window
+oxru ~/code/myapp           # open a folder in a window (bundled fonts, crisp glyphs)
+oxru --term ~/code/myapp    # run inside this terminal instead
 ```
+
+**Windowed is the default.** `--term` (or `-t`) runs Oxru inside the terminal you launched it from; `--gui` still works if you'd rather be explicit. Over SSH — or on a build compiled with `--no-default-features` — the terminal is used automatically, since there's no window to open.
 
 You start on a blank screen with a few hints. Everything is keyboard-driven, and the windowed build also takes the mouse — click a tab to switch, click in the editor to drop the cursor.
 
-> **On the keys below.** They're written in `Ctrl` form; in the windowed build `⌘` works anywhere `Ctrl` does. In **terminal mode** every Oxru shortcut takes one extra key so it can't collide with your shell — `Ctrl+…` becomes `Ctrl+Alt+…`, `Alt+…` becomes `Alt+Shift+…`. **`F1`** shows the full list with the right combos for the mode you're in, and `Ctrl+Q` quits.
+> **On the keys below.** They're written in `Ctrl` form, and `⌘` works anywhere `Ctrl` does. **The same combo does the same thing in the terminal and in the window** — one keymap, no per-mode variants to remember. **`F1`** shows the full list, and `Ctrl+Q` quits.
 
 ### Files
 
@@ -128,15 +130,36 @@ Open files get line numbers and tree-sitter syntax highlighting (Rust, JS, TS, P
 | `Alt+N` / `Alt+W` | New terminal · close the current one |
 | `Alt+G` | Grid (all at once) vs. tabs — click a tile to focus it |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous terminal |
-| `⌘K` | Quick-switch by name (type to filter) — ⌘/Super, which the shell never needs |
-| `⌘1`–`⌘9` | Jump straight to terminal N |
+| `Alt+K` | Quick-switch by name (type to filter) |
+| `Alt+1`–`Alt+9` | Jump straight to terminal N |
 | `Ctrl+Shift+←/→` | Move the terminal left / right |
 | `Shift+PgUp/PgDn` (`fn+↑/↓`) | Scroll back through history |
 | `Alt+↑/↓` | Copy mode — free cursor, `Shift`+arrows to select, `Enter`/`y` copies |
 
+**Click a link** in terminal output and Oxru asks before opening it in your browser — the full URL is shown, `Enter` opens, `Esc` cancels. Only `http://` and `https://` are offered: terminal output is untrusted, so schemes like `file://` or a custom app handler are never actionable. Dragging across a link still selects text as before.
+
+Terminal output uses a **modern ANSI palette** (VSCode's), because the renderer's built-in one is the original xterm table — red `#800000`, blue `#000080` — which measures 1.1–1.6:1 against a dark background, i.e. all but invisible. Every colour is overridable with `ansi_red`, `ansi_bright_blue`, and so on.
+
 Terminals are named by their **folder · running command** (e.g. `server · node`, `web · vite`) so you can tell them apart at a glance.
 
 **The neat part:** if a script you run inside a terminal tries to open a *new* OS terminal window, Oxru catches it and opens a new tab **inside** instead. Run your project's `run.sh` that fans out into five windows and you get five tabs — no desktop clutter.
+
+It covers every everyday way a script starts one: AppleScript `do script` (via `-e`, a heredoc on stdin, or a `.scpt` file), iTerm's `write text`, JavaScript-for-Automation `doScript()`, and `open -a Terminal` / `open -b com.apple.Terminal` / a double-clicked `.command`. Other terminal emulators (iTerm, kitty, Alacritty, WezTerm, Ghostty, Warp, Hyper) are recognised too. Anything that *isn't* a terminal — `display dialog`, `open -a Simulator`, a URL — runs untouched.
+
+If something still slips through, it's logged: every call the shims decline is written to Oxru's log as `shim let a call through to the real binary`, with the exact command, so it can be identified rather than guessed at. One case can't be intercepted at all — a script calling `/usr/bin/osascript` by absolute path bypasses `PATH`, and nothing short of code injection can catch that.
+
+### To-do list & clipboard
+
+| Shortcut | Action |
+|---|---|
+| `Alt+D` | Global to-do list |
+| `Alt+V` | Clipboard history — this session's copies, newest first |
+
+The to-do list is a plain markdown file at `~/.config/oxru/todos.md`, and the dialog is a view over it. Type to add · `Space` toggles · `Ctrl+D` deletes · `Ctrl+Shift+D` clears everything completed · **`Ctrl+E` opens the file as a normal editor tab**, so "edit as plain text" is the real editor — undo, multi-cursor, find and all.
+
+Parsing is forgiving and writing normalises: `- [x] a`, `* [X] a`, `[x] a` all mean done, and a **plain line or a `-`/`1.` list item becomes an unchecked task**, so you can paste a list and it turns into checkboxes. Headings and blank lines round-trip untouched, so structure you add yourself survives.
+
+Clipboard history is **in memory only and never written to disk** — a clipboard history is exactly where a password ends up. It holds the last 50 copies from inside Oxru (editor, terminal selection, copy-path); `Enter` pastes into wherever you were, and also sets the system clipboard so a plain `Ctrl+V` repeats it. `Ctrl+D` clears it.
 
 ### Settings
 

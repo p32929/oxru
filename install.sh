@@ -45,4 +45,4 @@ case ":${PATH}:" in
 esac
 
 echo
-echo "Try it:    oxru --gui ."
+echo "Try it:    oxru .        (a window; add --term to stay in this terminal)"

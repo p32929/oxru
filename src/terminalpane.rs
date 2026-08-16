@@ -15,6 +15,12 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 /// How often to re-check the foreground process for the tab label.
 const PROC_POLL: Duration = Duration::from_millis(400);
 
+/// Floor between working-directory reads for one pane. Slower than
+/// [`PROC_POLL`] because each read forks `lsof`, and it only fires at all after
+/// the pane has printed something (see `TerminalPane::cwd_dirty`), so a quiet
+/// terminal never pays for it.
+const CWD_POLL: Duration = Duration::from_millis(600);
+
 /// Lines of scrollback history each terminal keeps. A terminal that's actually
 /// filled its scrollback with real output can run tens of MB per 1,000 lines
 /// (each cell carries its own styling), so this is a real memory knob, not
@@ -49,6 +55,13 @@ pub struct TerminalPane {
     /// running command.
     shell_name: String,
     last_proc_check: Instant,
+    /// Set whenever the pane produces output, cleared once the working
+    /// directory has been re-read. A shell that printed something is a shell
+    /// that may have just `cd`'d; one sitting silent cannot have moved, so it
+    /// costs nothing to leave alone — which matters because reading the cwd
+    /// forks `lsof` (see [`process_cwd`]).
+    cwd_dirty: bool,
+    last_cwd_check: Instant,
     /// The vt100 emulator, written by the **reader thread** (so PTY output is
     /// consumed even when the UI event loop is parked) and read under the lock
     /// for rendering and queries.
@@ -67,6 +80,9 @@ pub struct TerminalPane {
     cols: u16,
     /// Scrollback offset in rows (0 = following the live bottom).
     scroll: usize,
+    /// Rows of history at the last pump, so new output can be measured. See
+    /// the scroll-lock handling in [`TerminalPane::pump`].
+    history_len: usize,
     /// Selection anchor / live end as `(line_id, col)`, where `line_id` is the
     /// number of lines above the live bottom (0 = bottom row). Storing it this way
     /// (rather than visible coords) keeps a selection anchored to its text as the
@@ -156,6 +172,64 @@ impl TerminalPane {
     #[cfg(test)]
     pub fn set_finished_unseen_for_test(&mut self) {
         self.finished_unseen = true;
+    }
+
+    /// The URL under terminal cell `(row, col)`, if there is one.
+    ///
+    /// Long URLs almost always wrap, so the logical line is rebuilt first: a row
+    /// whose last cell is occupied is treated as continuing into the next one,
+    /// which is how a terminal wraps. Without that, clicking a wrapped link
+    /// would hand back half of it.
+    pub fn url_at(&self, row: u16, col: u16) -> Option<String> {
+        let screen = self.screen();
+        let (rows, cols) = screen.size();
+        if row >= rows || col >= cols {
+            return None;
+        }
+        let text_of = |r: u16| -> String {
+            (0..cols)
+                .map(|c| {
+                    screen
+                        .cell(r, c)
+                        .map(|cell| {
+                            let s = cell.contents();
+                            if s.is_empty() { " ".to_string() } else { s.to_string() }
+                        })
+                        .unwrap_or_else(|| " ".to_string())
+                })
+                .collect()
+        };
+        let is_full = |r: u16| -> bool {
+            screen.cell(r, cols - 1).map(|c| !c.contents().trim().is_empty()).unwrap_or(false)
+        };
+
+        // Walk back to the first row of this wrapped run, then forward to the
+        // last, so `at` can be expressed against the joined text.
+        let mut first = row;
+        while first > 0 && is_full(first - 1) {
+            first -= 1;
+        }
+        let mut last = row;
+        while last + 1 < rows && is_full(last) {
+            last += 1;
+        }
+
+        let mut joined = String::new();
+        let mut at = 0usize;
+        for r in first..=last {
+            let t = text_of(r);
+            if r == row {
+                at = joined.chars().count() + col as usize;
+            }
+            // Only a *wrapped* row runs straight into the next; a short row
+            // ended on its own, so keep them separated or two unrelated lines
+            // would glue into one bogus link.
+            joined.push_str(t.trim_end());
+            if !is_full(r) {
+                joined.push(' ');
+            }
+        }
+        url_span_at(&joined, at)
     }
 
     /// The tab label: the folder, plus the running command when one is active.
@@ -249,6 +323,9 @@ impl TerminalPane {
             proc: String::new(),
             shell_name,
             last_proc_check: Instant::now() - PROC_POLL,
+            // Check once as soon as the shell first prints its prompt.
+            cwd_dirty: true,
+            last_cwd_check: Instant::now() - CWD_POLL,
             parser,
             pending,
             stamp,
@@ -258,6 +335,7 @@ impl TerminalPane {
             rows,
             cols,
             scroll: 0,
+            history_len: 0,
             sel_anchor: None,
             sel_cursor: None,
             copy_mode: false,
@@ -286,12 +364,41 @@ impl TerminalPane {
                     );
                 }
             }
-            // Keep the view anchored where the user left it (0 = live bottom).
+            // Scroll lock: hold the *text* still while output streams past.
+            //
+            // The offset is measured from the live bottom, so simply re-applying
+            // it (which is what this did) drags the viewport down one row for
+            // every row that arrives — the line you were reading marches off the
+            // top and you end up at the bottom within seconds. Holding the
+            // offset is not holding the position. Growing it by however much
+            // history arrived keeps the same text on screen; at offset 0 the
+            // pane is following the bottom and should keep following it.
             let mut p = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+            let len = Self::history_len(&mut p);
+            let arrived = len.saturating_sub(self.history_len);
+            if self.scroll > 0 {
+                self.scroll = (self.scroll + arrived).min(len);
+            }
+            self.history_len = len;
+            // A mark is stored the same bottom-relative way, so it needs the
+            // same correction — otherwise it stays a fixed distance from the
+            // bottom while the bottom moves, and the highlight visibly travels
+            // down the screen onto whatever unrelated output has arrived since.
+            // Applied whether or not the view is scrolled: at the bottom the
+            // marked text is sliding up into history, and the mark has to
+            // follow it there.
+            if arrived > 0 {
+                let ceiling = len + self.rows as usize;
+                for (lid, _) in [&mut self.sel_anchor, &mut self.sel_cursor].into_iter().flatten() {
+                    *lid = (*lid + arrived).min(ceiling);
+                }
+            }
             p.screen_mut().set_scrollback(self.scroll);
             self.scroll = p.screen().scrollback();
+            self.cwd_dirty = true;
         }
         self.refresh_foreground();
+        self.refresh_folder();
         bytes
     }
 
@@ -362,11 +469,29 @@ impl TerminalPane {
         ((1i64 << 40) - lineid as i64) * (self.cols as i64 + 1) + col as i64
     }
 
+    /// How many rows of history exist right now.
+    ///
+    /// vt100 has no getter for this, but `set_scrollback` clamps to it — so ask
+    /// for an impossible offset and read back what you were given, then restore.
+    fn history_len(p: &mut vt100::Parser) -> usize {
+        let current = p.screen().scrollback();
+        p.screen_mut().set_scrollback(usize::MAX);
+        let len = p.screen().scrollback();
+        p.screen_mut().set_scrollback(current);
+        len
+    }
+
     /// Set the scrollback offset directly (clamped to the real history depth).
     fn set_scroll(&mut self, s: usize) {
         let mut p = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         p.screen_mut().set_scrollback(s);
         self.scroll = p.screen().scrollback();
+        // Re-baseline the history measurement at the moment the view moves.
+        // The reader thread parses output continuously, so history can have
+        // grown since the last pump; without this, that growth is counted as
+        // "arrived while scrolled up" and the view jumps by however much had
+        // landed *before* the user scrolled.
+        self.history_len = Self::history_len(&mut p);
     }
 
     /// Scroll so `lineid` is on screen; returns it clamped to reachable history.
@@ -410,6 +535,12 @@ impl TerminalPane {
             self.sel_anchor = self.sel_cursor.or(Some((lid, col)));
         }
         self.sel_cursor = Some((lid, col));
+    }
+
+    /// Whether a non-empty selection is currently held. A click that produced
+    /// a selection was a drag, not a click on a link.
+    pub fn selection_active(&self) -> bool {
+        matches!((self.sel_anchor, self.sel_cursor), (Some(a), Some(c)) if a != c)
     }
 
     pub fn clear_selection(&mut self) {
@@ -671,6 +802,33 @@ impl TerminalPane {
         self.set_proc(proc);
     }
 
+    /// Re-read the shell's working directory so the tab follows `cd`.
+    ///
+    /// The label used to be frozen at spawn: `cd`ing to another repo left the
+    /// tab still naming the folder the terminal started in, which is exactly
+    /// backwards for a tab strip whose whole job is telling you which project
+    /// each terminal is in.
+    ///
+    /// Skipped while a command is running, for two reasons: the process-group
+    /// leader is then the command rather than the shell, so its cwd needn't be
+    /// the shell's, and a build streaming output would otherwise re-fork `lsof`
+    /// on every poll. The label catches up the moment the prompt returns.
+    fn refresh_folder(&mut self) {
+        if !self.cwd_dirty || self.is_running() {
+            return;
+        }
+        if self.last_cwd_check.elapsed() < CWD_POLL {
+            return;
+        }
+        self.last_cwd_check = Instant::now();
+        self.cwd_dirty = false;
+        if let Some(name) = self.current_dir().map(|d| crate::app::folder_name(&d)) {
+            if name != self.folder {
+                self.folder = name;
+            }
+        }
+    }
+
     /// Apply a freshly-detected foreground process name, flagging
     /// finished-unseen on a running→idle edge. Split out from
     /// [`Self::refresh_foreground`] so tests can drive the transition
@@ -836,6 +994,73 @@ fn process_name(_pid: i32) -> Option<String> {
     None
 }
 
+/// Find the URL covering character index `at` in `line`, if any.
+///
+/// Only `http://` and `https://` are recognised. That's a security choice, not
+/// a shortcut: terminal output is untrusted — any repo you build, any log you
+/// tail, can print whatever it likes — and honouring schemes like `file://`,
+/// `javascript:` or a custom app handler would turn "click a link" into "run
+/// something the output chose". A confirmation prompt guards the click; the
+/// scheme allow-list guards what a confirmation can even be for.
+pub fn url_span_at(line: &str, at: usize) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    for (start, _) in line.char_indices() {
+        // Work in char positions, not byte offsets, so a line with any
+        // non-ASCII in it doesn't shift every URL's bounds.
+        let cstart = line[..start].chars().count();
+        if !starts_scheme(&chars[cstart..]) {
+            continue;
+        }
+        let mut end = cstart;
+        while end < chars.len() && !is_url_terminator(chars[end]) {
+            end += 1;
+        }
+        let end = trim_trailing(&chars[cstart..end]) + cstart;
+        if at >= cstart && at < end && end - cstart > SCHEME_MIN {
+            return Some(chars[cstart..end].iter().collect());
+        }
+    }
+    None
+}
+
+/// Shortest thing that could still be a URL: `http://` plus one character.
+const SCHEME_MIN: usize = 8;
+
+fn starts_scheme(rest: &[char]) -> bool {
+    let s: String = rest.iter().take(8).collect();
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// A URL ends at whitespace, or at a character a terminal would never carry
+/// inside one (quotes and angle brackets, which shells and logs wrap URLs in).
+fn is_url_terminator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | '|')
+}
+
+/// Drop trailing punctuation that belongs to the surrounding prose rather than
+/// the URL — "see https://example.com/x." ends in a full stop, not a path.
+/// A closing bracket is only dropped when it has no opener inside the URL, so
+/// a real `…/Foo_(bar)` link survives.
+fn trim_trailing(url: &[char]) -> usize {
+    let mut end = url.len();
+    while end > 0 {
+        let c = url[end - 1];
+        let drop = match c {
+            '.' | ',' | ';' | ':' | '!' | '?' => true,
+            ')' => url[..end - 1].iter().filter(|&&c| c == '(').count()
+                <= url[..end - 1].iter().filter(|&&c| c == ')').count(),
+            ']' => url[..end - 1].iter().filter(|&&c| c == '[').count()
+                <= url[..end - 1].iter().filter(|&&c| c == ']').count(),
+            _ => false,
+        };
+        if !drop {
+            break;
+        }
+        end -= 1;
+    }
+    end
+}
+
 /// The live working directory of `pid`, via `lsof` (no stable libproc struct
 /// layout to lean on across macOS versions, so we shell out like
 /// [`read_git_status`](crate::app) already does for `git`).
@@ -872,6 +1097,346 @@ mod tests {
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.cwd(&dir);
         TerminalPane::spawn("t", 24, 80, cmd, None).unwrap()
+    }
+
+    /// The tab has to follow `cd`. It used to name the folder the terminal was
+    /// spawned in, forever.
+    #[test]
+    fn the_folder_label_follows_the_shells_working_directory() {
+        // A real shell, told to cd somewhere else, then left at a prompt.
+        let start = std::env::temp_dir();
+        let target = start.join(format!("oxru-cwd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&target).unwrap();
+
+        // The user's real shell, as `App::new_terminal` spawns: the pane
+        // recognises `$SHELL` as "idle", and anything else as a running
+        // command — which would keep the cwd read permanently deferred.
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.cwd(&start);
+        let mut term = TerminalPane::spawn("t", 24, 80, cmd, None).unwrap();
+        assert_eq!(term.folder, "t", "starts with the label it was given");
+
+        term.send_input(format!("cd '{}'\n", target.display()).as_bytes());
+
+        // Pump until the label catches up (the read is throttled and only
+        // happens once the shell has printed its prompt back).
+        let expect = target.file_name().unwrap().to_string_lossy().into_owned();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && term.folder != expect {
+            term.pump();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::remove_dir_all(&target).ok();
+
+        // `process_cwd` is a no-op off macOS, where there's nothing to assert.
+        if cfg!(target_os = "macos") {
+            assert_eq!(term.folder, expect, "the tab should name where the shell now is");
+        }
+    }
+
+    /// The read forks `lsof`, so it must not fire for a terminal that hasn't
+    /// printed anything, nor while a command is running.
+    #[test]
+    fn the_working_directory_is_only_re_read_when_it_could_have_changed() {
+        let mut term = idle_term();
+
+        term.cwd_dirty = false;
+        term.last_cwd_check = Instant::now() - CWD_POLL * 2;
+        term.refresh_folder();
+        assert!(!term.cwd_dirty, "no output since the last read: nothing to do");
+
+        // Fresh output while a command runs: still skipped, so a build
+        // streaming output can't re-fork `lsof` on every poll.
+        term.cwd_dirty = true;
+        term.set_proc("cargo".to_string());
+        term.refresh_folder();
+        assert!(term.cwd_dirty, "deferred while a command holds the terminal");
+
+        // Back at the prompt: now it reads, and clears the flag.
+        term.set_proc(String::new());
+        term.refresh_folder();
+        assert!(!term.cwd_dirty, "read once the shell is idle again");
+    }
+
+    #[test]
+    fn finds_the_url_under_the_clicked_column() {
+        let line = "see https://example.com/a/b for details";
+        let at = line.find("example").unwrap();
+        assert_eq!(url_span_at(line, at).as_deref(), Some("https://example.com/a/b"));
+        // Clicking outside the span finds nothing.
+        assert_eq!(url_span_at(line, 0), None);
+        assert_eq!(url_span_at(line, line.chars().count() - 1), None);
+    }
+
+    #[test]
+    fn trailing_prose_punctuation_is_not_part_of_the_link() {
+        for (line, want) in [
+            ("go to https://example.com/x.", "https://example.com/x"),
+            ("https://example.com/x, then", "https://example.com/x"),
+            ("(https://example.com/x)", "https://example.com/x"),
+            ("[https://example.com/x]", "https://example.com/x"),
+        ] {
+            let at = line.find("http").unwrap() + 10;
+            assert_eq!(url_span_at(line, at).as_deref(), Some(want), "{line}");
+        }
+    }
+
+    #[test]
+    fn brackets_that_belong_to_the_url_survive() {
+        // A wiki-style link really does end in ')'.
+        let line = "https://en.wikipedia.org/wiki/Foo_(bar)";
+        assert_eq!(url_span_at(line, 10).as_deref(), Some(line));
+    }
+
+    #[test]
+    fn quotes_and_angle_brackets_delimit_it() {
+        for line in ["\"https://example.com/x\"", "<https://example.com/x>"] {
+            assert_eq!(url_span_at(line, 10).as_deref(), Some("https://example.com/x"), "{line}");
+        }
+    }
+
+    /// Terminal output is untrusted: anything you build or tail can print a
+    /// line. Only http(s) is offered, so a click can never be turned into
+    /// "open this local file" or "hand this to some app's URL handler".
+    #[test]
+    fn only_http_and_https_are_recognised() {
+        for line in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "vscode://file/etc/passwd",
+            "ftp://example.com/x",
+            "data:text/html;base64,AAAA",
+        ] {
+            assert_eq!(url_span_at(line, 6), None, "{line} must not be offered");
+        }
+    }
+
+    #[test]
+    fn a_line_with_two_urls_picks_the_one_clicked() {
+        let line = "https://one.example/a  https://two.example/b";
+        let first = line.find("one").unwrap();
+        let second = line.find("two").unwrap();
+        assert_eq!(url_span_at(line, first).as_deref(), Some("https://one.example/a"));
+        assert_eq!(url_span_at(line, second).as_deref(), Some("https://two.example/b"));
+        // The gap between them isn't a link.
+        assert_eq!(url_span_at(line, line.find("  ").unwrap()), None);
+    }
+
+    #[test]
+    fn non_ascii_earlier_in_the_line_does_not_shift_the_span() {
+        // Byte offsets and char positions diverge here; the scanner works in
+        // chars, which is what a click's column is.
+        let line = "→ ✓ https://example.com/x done";
+        let at = line.chars().position(|c| c == 'e').unwrap();
+        assert_eq!(url_span_at(line, at).as_deref(), Some("https://example.com/x"));
+    }
+
+    /// A broad table of real-world lines, each clicked at *every* column: the
+    /// answer must be the same wherever inside a URL you click, and `None`
+    /// everywhere outside it. The per-case tests above pin individual rules;
+    /// this pins them all holding at once, which is what actually clicking
+    /// around in a terminal exercises.
+    #[test]
+    fn every_column_of_a_line_resolves_consistently() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("https://example.com", Some("https://example.com")),
+            ("http://example.com/a/b/c", Some("http://example.com/a/b/c")),
+            ("https://example.com/a?x=1&y=2#f", Some("https://example.com/a?x=1&y=2#f")),
+            ("Docs live at https://example.com/guide.", Some("https://example.com/guide")),
+            ("See https://example.com/guide, then run.", Some("https://example.com/guide")),
+            ("Ends in a colon: https://example.com/x:", Some("https://example.com/x")),
+            ("(https://example.com/inside-parens)", Some("https://example.com/inside-parens")),
+            ("[https://example.com/inside-brackets]", Some("https://example.com/inside-brackets")),
+            ("\"https://example.com/inside-quotes\"", Some("https://example.com/inside-quotes")),
+            ("<https://example.com/inside-angles>", Some("https://example.com/inside-angles")),
+            ("https://en.wikipedia.org/wiki/Rust_(language)", Some("https://en.wikipedia.org/wiki/Rust_(language)")),
+            ("ERROR  build failed, see https://example.com/logs/42 for output", Some("https://example.com/logs/42")),
+            ("→ ✓ https://example.com/after-non-ascii is still correct", Some("https://example.com/after-non-ascii")),
+            ("file:///etc/passwd", None),
+            ("javascript:alert(document.cookie)", None),
+            ("vscode://file/etc/passwd", None),
+            ("ftp://example.com/pub/file.txt", None),
+            ("data:text/html;base64,PHNjcmlwdD4=", None),
+            ("example.com/no-scheme", None),
+            ("ssh://git@example.com/repo.git", None),
+            ("plain text with no link at all", None),
+        ];
+        let mut bad = 0;
+        for (line, want) in cases {
+            // Click every column; the span must be `want` inside it, None outside.
+            let hits: Vec<String> = (0..line.chars().count())
+                .filter_map(|i| url_span_at(line, i))
+                .collect();
+            let got = hits.first().map(String::as_str);
+            let uniform = hits.iter().all(|h| Some(h.as_str()) == got);
+            if got != *want || !uniform {
+                println!("MISMATCH {line:?}\n   want {want:?}  got {got:?} uniform={uniform}");
+                bad += 1;
+            }
+        }
+        assert_eq!(bad, 0, "{bad} lines didn't resolve as expected");
+    }
+
+    /// Scrolled up, the text must stay put while output streams past — the
+    /// whole point of scrolling up in a log. It used to slide one row per
+    /// arriving row, so a busy terminal dragged you back to the bottom within
+    /// seconds.
+    #[test]
+    fn scrolling_up_holds_the_text_still_while_output_arrives() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.cwd(std::env::temp_dir());
+        let mut term = TerminalPane::spawn("t", 24, 80, cmd, None).unwrap();
+
+        // A block of numbered lines to scroll back into.
+        term.send_input(b"for i in $(seq 1 60); do echo \"LINE-$i\"; done\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !screen_contains(&term, "LINE-60") {
+            term.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(screen_contains(&term, "LINE-60"), "seed output never arrived");
+
+        // Scroll up into the history and remember exactly what's on screen.
+        term.scroll_lines(15);
+        assert!(term.scroll_offset() > 0, "should be scrolled up");
+        let before = visible_text(&term);
+        let offset_before = term.scroll_offset();
+
+        // Now stream a lot more output past it.
+        term.send_input(b"for i in $(seq 1 80); do echo \"NOISE-$i\"; done\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            term.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            visible_text(&term),
+            before,
+            "the view moved while the user was scrolled up"
+        );
+        assert!(
+            term.scroll_offset() > offset_before,
+            "the offset must grow as history arrives, or the text can't have held still"
+        );
+    }
+
+    /// …and at the bottom it must still follow, or the terminal would freeze.
+    #[test]
+    fn at_the_bottom_the_view_keeps_following_new_output() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.cwd(std::env::temp_dir());
+        let mut term = TerminalPane::spawn("t", 24, 80, cmd, None).unwrap();
+        term.send_input(b"echo FIRST-MARKER\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !screen_contains(&term, "FIRST-MARKER") {
+            term.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(term.scroll_offset(), 0, "starts at the bottom");
+
+        term.send_input(b"echo SECOND-MARKER\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !screen_contains(&term, "SECOND-MARKER") {
+            term.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(screen_contains(&term, "SECOND-MARKER"), "following the bottom");
+        assert_eq!(term.scroll_offset(), 0, "and still pinned there");
+    }
+
+    fn visible_text(t: &TerminalPane) -> String {
+        let screen = t.screen();
+        let (rows, cols) = screen.size();
+        (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| screen.cell(r, c).map(|x| x.contents()).unwrap_or_default())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn screen_contains(t: &TerminalPane, needle: &str) -> bool {
+        visible_text(t).contains(needle)
+    }
+
+    /// Marking text while scrolled up must not restart the auto-scroll.
+    #[test]
+    fn a_selection_does_not_break_scroll_lock() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.cwd(std::env::temp_dir());
+        let mut term = TerminalPane::spawn("t", 24, 80, cmd, None).unwrap();
+        term.send_input(b"for i in $(seq 1 60); do echo \"LINE-$i\"; done\n");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            term.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        term.scroll_lines(15);
+        // Mark a couple of rows, the way a mouse drag does.
+        term.begin_selection(5, 0);
+        term.update_selection(7, 20);
+        let before = visible_text(&term);
+        assert!(term.selection_text().is_some(), "something is selected");
+        let after_copy = visible_text(&term);
+        assert_eq!(after_copy, before, "reading the selection moved the view");
+
+        term.send_input(b"for i in $(seq 1 80); do echo \"NOISE-$i\"; done\n");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            term.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            visible_text(&term),
+            before,
+            "the view scrolled while text was selected and output arrived"
+        );
+    }
+
+    /// A mark must stay on the text it was made on. Both the mark and the
+    /// scroll offset are stored as a distance from the live bottom, so output
+    /// arriving moves them both off their content — the highlight slides down
+    /// the screen onto unrelated output, which reads as the terminal scrolling
+    /// even though the view itself is holding still.
+    #[test]
+    fn a_mark_stays_on_the_text_it_was_made_on() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.cwd(std::env::temp_dir());
+        let mut term = TerminalPane::spawn("t", 24, 80, cmd, None).unwrap();
+        term.send_input(b"for i in $(seq 1 60); do echo \"LINE-$i\"; done\n");
+        let d = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < d {
+            term.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        term.scroll_lines(15);
+        term.begin_selection(5, 0);
+        term.update_selection(5, 30);
+        let before = term.selection_text().unwrap_or_default();
+        assert!(before.starts_with("LINE-"), "seeded on a known line, got {before:?}");
+
+        term.send_input(b"for i in $(seq 1 80); do echo \"NOISE-$i\"; done\n");
+        let d = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < d {
+            term.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            term.selection_text().unwrap_or_default(),
+            before,
+            "the mark drifted onto different text as output arrived"
+        );
     }
 
     #[test]

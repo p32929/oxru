@@ -26,6 +26,57 @@ pub const ACCENT_PALETTE: &[(&str, (u8, u8, u8))] = &[
     ("White", (0xe0, 0xe0, 0xe0)),
 ];
 
+/// The 16 ANSI colours a program can ask for, in the standard order:
+/// black, red, green, yellow, blue, magenta, cyan, white, then the eight
+/// bright variants.
+///
+/// Oxru has to supply these itself. The rendering backend resolves
+/// `Color::Indexed(i)` through a *hardcoded* table — the original xterm one,
+/// where red is `#800000` and blue is `#000080` — and no builder option
+/// overrides it. Those values were chosen for CRTs; on a dark background they
+/// are barely legible, which is why terminal output looked so much worse here
+/// than in VSCode, whose terminal ships a modern palette. This is that palette
+/// (VSCode's Dark+ terminal colours), applied in both the window and the
+/// terminal so output reads the same wherever Oxru is running.
+pub const ANSI_PALETTE: [Color; 16] = [
+    Color::Rgb(0x00, 0x00, 0x00), // black
+    Color::Rgb(0xcd, 0x31, 0x31), // red
+    Color::Rgb(0x0d, 0xbc, 0x79), // green
+    Color::Rgb(0xe5, 0xe5, 0x10), // yellow
+    Color::Rgb(0x24, 0x72, 0xc8), // blue
+    Color::Rgb(0xbc, 0x3f, 0xbc), // magenta
+    Color::Rgb(0x11, 0xa8, 0xcd), // cyan
+    Color::Rgb(0xe5, 0xe5, 0xe5), // white
+    Color::Rgb(0x66, 0x66, 0x66), // bright black
+    Color::Rgb(0xf1, 0x4c, 0x4c), // bright red
+    Color::Rgb(0x23, 0xd1, 0x8b), // bright green
+    Color::Rgb(0xf5, 0xf5, 0x43), // bright yellow
+    Color::Rgb(0x3b, 0x8e, 0xea), // bright blue
+    Color::Rgb(0xd6, 0x70, 0xd6), // bright magenta
+    Color::Rgb(0x29, 0xb8, 0xdb), // bright cyan
+    Color::Rgb(0xe5, 0xe5, 0xe5), // bright white
+];
+
+/// Config keys for [`ANSI_PALETTE`], in the same order.
+pub const ANSI_KEYS: [&str; 16] = [
+    "ansi_black",
+    "ansi_red",
+    "ansi_green",
+    "ansi_yellow",
+    "ansi_blue",
+    "ansi_magenta",
+    "ansi_cyan",
+    "ansi_white",
+    "ansi_bright_black",
+    "ansi_bright_red",
+    "ansi_bright_green",
+    "ansi_bright_yellow",
+    "ansi_bright_blue",
+    "ansi_bright_magenta",
+    "ansi_bright_cyan",
+    "ansi_bright_white",
+];
+
 /// Darken an accent channel to make a harmonious selection background.
 fn dim_channel(c: u8) -> u8 {
     (c as f32 * 0.38) as u8
@@ -97,6 +148,18 @@ pub struct Theme {
     pub line_hl: Color,
     /// The vertical rule drawn at each indent level (`editorIndentGuide`).
     pub indent_guide: Color,
+    /// The 16 ANSI colours terminal output asks for — see [`ANSI_PALETTE`].
+    pub ansi: [Color; 16],
+    /// Surface behind an embedded terminal, for cells the program hasn't
+    /// coloured itself.
+    ///
+    /// Matches `bg` by default. It was briefly lifted a few steps to rescue
+    /// unreadable output, but that was treating the symptom: the real cause was
+    /// the ANSI palette (see [`ANSI_PALETTE`]), and a lighter surface actually
+    /// costs contrast — every coloured foreground measures ~13% worse against
+    /// `#26262b` than against `#1a1a1c`. Kept as its own slot so a terminal
+    /// *can* be set apart deliberately, at a known cost.
+    pub terminal_bg: Color,
     /// Primary foreground text (`editor.foreground`).
     pub fg: Color,
     /// Dimmed text: line numbers, inactive labels.
@@ -153,6 +216,8 @@ fn dark_plus() -> Theme {
         border: Color::Rgb(0x3d, 0x3d, 0x46),
         line_hl: Color::Rgb(0x28, 0x28, 0x30),
         indent_guide: Color::Rgb(0x33, 0x33, 0x3a),
+        terminal_bg: Color::Rgb(0x1a, 0x1a, 0x1c),
+        ansi: ANSI_PALETTE,
         fg: Color::Rgb(0xd4, 0xd4, 0xd4),
         fg_dim: Color::Rgb(0x85, 0x85, 0x85),
         accent,
@@ -198,6 +263,10 @@ impl Theme {
         t.border = blend(t.border);
         t.line_hl = blend(t.line_hl);
         t.indent_guide = blend(t.indent_guide);
+        t.terminal_bg = blend(t.terminal_bg);
+        for c in &mut t.ansi {
+            *c = blend(*c);
+        }
         t.fg = blend(t.fg);
         t.fg_dim = blend(t.fg_dim);
         t.accent = blend(t.accent);
@@ -231,6 +300,7 @@ impl Theme {
                 "border" => self.border = color,
                 "line_hl" => self.line_hl = color,
                 "indent_guide" => self.indent_guide = color,
+                "terminal_bg" => self.terminal_bg = color,
                 "fg" => self.fg = color,
                 "fg_dim" => self.fg_dim = color,
                 "accent" => self.accent = color,
@@ -248,6 +318,11 @@ impl Theme {
                 "cyan" => self.cyan = color,
                 "comment" => self.comment = color,
                 _ => {}
+            }
+        }
+        for (i, key) in ANSI_KEYS.iter().enumerate() {
+            if let Some(c) = overrides.get(*key).and_then(|v| parse_hex(v)) {
+                self.ansi[i] = c;
             }
         }
         // Everything derived from the accent has to be re-derived when the
@@ -355,6 +430,77 @@ fn parse_hex(s: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Relative luminance contrast, the WCAG formula. Used to assert the ANSI
+    /// palette is actually legible rather than eyeballing hex values.
+    fn contrast(fg: Color, bg: Color) -> f32 {
+        fn lum(c: Color) -> f32 {
+            let (r, g, b) = match c {
+                Color::Rgb(r, g, b) => (r, g, b),
+                _ => (0, 0, 0),
+            };
+            let ch = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+        }
+        let (a, b) = (lum(fg) + 0.05, lum(bg) + 0.05);
+        if a > b { a / b } else { b / a }
+    }
+
+    /// The reported bug: terminal output was far harder to read than the same
+    /// output in VSCode. Cause — the renderer resolves `Color::Indexed` through
+    /// a hardcoded *original xterm* table (red `#800000`, blue `#000080`), which
+    /// no builder option overrides. Those are unreadable on a dark background;
+    /// blue measured 1.06:1, which is invisible.
+    #[test]
+    fn the_ansi_palette_is_legible_unlike_the_xterm_defaults() {
+        let t = Theme::default();
+        let bg = t.terminal_bg;
+
+        let xterm_blue = Color::Rgb(0x00, 0x00, 0x80);
+        let xterm_red = Color::Rgb(0x80, 0x00, 0x00);
+        // Measured: blue 1.09:1, red 1.59:1 — at 1.0 the text *is* the
+        // background, so these were all but invisible.
+        assert!(contrast(xterm_blue, bg) < 1.2, "sanity: the old blue really was invisible");
+        assert!(contrast(xterm_red, bg) < 1.7, "sanity: the old red really was invisible");
+        // …and each is at least doubled by the palette we ship.
+        assert!(contrast(t.ansi[4], bg) > 2.0 * contrast(xterm_blue, bg), "blue must improve");
+        assert!(contrast(t.ansi[1], bg) > 2.0 * contrast(xterm_red, bg), "red must improve");
+
+        // Every colour a program is likely to write text in must clear a plain
+        // legibility bar. Black (index 0) is excluded: black-on-dark is
+        // unreadable everywhere, VSCode included, and programs don't use it for
+        // text — faking it would be a lie about what the palette is.
+        for (i, c) in t.ansi.iter().enumerate().filter(|(i, _)| *i != 0 && *i != 8) {
+            let ratio = contrast(*c, bg);
+            assert!(
+                ratio >= 2.5,
+                "ansi[{i}] {c:?} is {ratio:.2}:1 against the terminal background"
+            );
+        }
+        // The bright variants — what most tools actually colour output with —
+        // clear the WCAG large-text bar.
+        for (i, c) in t.ansi.iter().enumerate().skip(9) {
+            let ratio = contrast(*c, bg);
+            assert!(ratio >= 3.0, "bright ansi[{i}] {c:?} is only {ratio:.2}:1");
+        }
+    }
+
+    /// A lighter terminal surface *costs* contrast — it was tried as a fix for
+    /// the above and made every coloured foreground worse. Pinned so the two
+    /// are not "fixed" in opposite directions again.
+    #[test]
+    fn lifting_the_terminal_surface_would_cost_contrast() {
+        let t = Theme::default();
+        let lifted = Color::Rgb(0x26, 0x26, 0x2b);
+        let red = t.ansi[1];
+        assert!(
+            contrast(red, t.terminal_bg) > contrast(red, lifted),
+            "the darker surface must read better, or the revert was pointless"
+        );
+    }
 
     #[test]
     fn parses_hex_with_and_without_hash() {

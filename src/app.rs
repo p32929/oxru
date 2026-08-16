@@ -30,6 +30,38 @@ const TOAST_TTL: Duration = Duration::from_millis(2200);
 /// Hard ceiling on simultaneously open embedded terminals — see `new_terminal`.
 const MAX_TERMINALS: usize = 20;
 
+/// How many clipboard entries to keep. Deep enough to find the thing you
+/// copied a few minutes ago, shallow enough that the list stays scannable.
+const CLIP_HISTORY_MAX: usize = 50;
+
+/// One remembered copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipEntry {
+    /// The full text, pasted verbatim.
+    pub text: String,
+    /// A one-line preview for the list: leading whitespace dropped, inner
+    /// newlines and tabs collapsed to spaces, so a copied block of code shows
+    /// as a readable single row instead of wrecking the layout.
+    pub label: String,
+    /// Lines in the original, shown as a `+N lines` hint on multi-line entries.
+    pub lines: usize,
+}
+
+impl ClipEntry {
+    fn new(text: &str) -> Self {
+        let lines = text.lines().count().max(1);
+        let label: String = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .chars()
+            .map(|c| if c == '\t' { ' ' } else { c })
+            .collect();
+        ClipEntry { text: text.to_string(), label, lines }
+    }
+}
+
 /// The flavour of a toast, which picks its accent colour and icon.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -57,6 +89,11 @@ pub enum Dialog {
     /// Project-wide "Search in Files" (⌘⇧F) — search a query across every
     /// file in the project, VSCode's Search view.
     SearchFiles,
+    /// The global to-do list (⌥D). A view over `~/.config/oxru/todos.md`,
+    /// which ⌃E opens as an ordinary editor tab.
+    Todos,
+    /// Recent clipboard entries (⌥V), newest first.
+    Clipboard,
 }
 
 /// State for the terminal quick-switcher (⌘K while the terminal dialog is
@@ -488,6 +525,29 @@ pub struct App {
     /// Which rows are already open in a window (can't be checked / reopened).
     pub recent_disabled: Vec<bool>,
 
+    // To-do dialog state. The list itself lives in a markdown file; this is
+    // the copy read when the dialog opened, written back on every change.
+    pub todos: Vec<crate::todo::Entry>,
+    /// Where the to-do list is stored. `None` disables persistence entirely —
+    /// which is what the test build gets, so a test driving the dialog can
+    /// never write over the real list in the user's config dir.
+    pub todos_path: Option<PathBuf>,
+    /// Index into `todos` of the selected task (never a heading).
+    pub todo_cursor: usize,
+    /// The "add a task" input line.
+    pub todo_input: String,
+    pub todo_input_cursor: usize,
+    pub todo_input_anchor: Option<usize>,
+
+    // Clipboard-history dialog state.
+    /// The URL a click landed on, awaiting the confirm prompt's answer.
+    pub pending_url: Option<String>,
+    /// Recent copies, newest first. In memory only — never written to disk,
+    /// because a clipboard history is exactly the place a password ends up.
+    pub clip_ring: Vec<ClipEntry>,
+    /// Cursor row in the history list.
+    pub clip_cursor: usize,
+
     // Settings dialog state.
     pub settings_open: bool,
     /// Focused section: 0 = font size, 1 = theme colour.
@@ -636,11 +696,26 @@ impl App {
             recent_cursor: 0,
             recent_checked: Vec::new(),
             recent_disabled: Vec::new(),
+            todos: Vec::new(),
+            todos_path: if cfg!(test) { None } else { crate::todo::todos_path() },
+            todo_cursor: 0,
+            todo_input: String::new(),
+            todo_input_cursor: 0,
+            todo_input_anchor: None,
+            pending_url: None,
+            clip_ring: Vec::new(),
+            clip_cursor: 0,
             settings_open: false,
             settings_focus: 0,
             settings_color: 0,
             toast: None,
-            clipboard: arboard::Clipboard::new().ok(),
+            // No system clipboard under `cfg!(test)`: copy/paste then runs
+            // against the in-process `clipboard_text` mirror instead. Three
+            // reasons — a test run shouldn't overwrite whatever the developer
+            // has on their real clipboard, results shouldn't depend on what's
+            // sitting there, and several tests hammering NSPasteboard in
+            // parallel segfaults the suite outright.
+            clipboard: if cfg!(test) { None } else { arboard::Clipboard::new().ok() },
             clipboard_text: String::new(),
             config_path: crate::config::global_config_path(),
         })
@@ -738,6 +813,8 @@ impl App {
                 self.terminal_modal = true;
             }
             Dialog::TerminalPicker => self.init_terminal_picker(),
+            Dialog::Todos => self.init_todos(),
+            Dialog::Clipboard => self.clip_cursor = 0,
             Dialog::Help => self.help_scroll = 0,
             Dialog::SearchFiles => {
                 // Bump the generation so a job left over from a *previous*
@@ -797,6 +874,10 @@ impl App {
             }
             Dialog::Terminal => self.terminal_modal = false,
             Dialog::TerminalPicker => self.terminal_picker.query.clear(),
+            // The to-do list is already on disk — nothing to flush, and the
+            // in-memory copy is re-read next time the dialog opens.
+            Dialog::Todos => self.todo_input.clear(),
+            Dialog::Clipboard => self.clip_cursor = 0,
             Dialog::Help => self.help_scroll = 0,
             Dialog::SearchFiles => {
                 // Bump the generation too, so a job still running when the
@@ -1138,11 +1219,230 @@ impl App {
     // ---- clipboard / selection ----------------------------------------
 
     /// Store `text` on the system clipboard (mirrored in-process).
-    fn set_clipboard(&mut self, text: String) {
+    /// `pub(crate)` so other modules' tests can seed the clipboard; the copy
+    /// history hangs off this one funnel (see [`App::remember_copy`]).
+    pub(crate) fn set_clipboard(&mut self, text: String) {
         if let Some(cb) = &mut self.clipboard {
             let _ = cb.set_text(&text);
         }
+        // Every copy in the app funnels through here — editor copy/cut, the
+        // terminal's selection copy, copy-path — so recording the history in
+        // this one place catches all of them and can't drift as call sites are
+        // added.
+        self.remember_copy(&text);
         self.clipboard_text = text;
+    }
+
+    /// Push `text` onto the clipboard history (newest first, deduped,
+    /// capped). In memory only: see [`App::clip_ring`].
+    fn remember_copy(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        // Move-to-front on a repeat, like the recent-folders list — copying the
+        // same snippet twice shouldn't push older entries out.
+        self.clip_ring.retain(|e| e.text != text);
+        self.clip_ring.insert(0, ClipEntry::new(text));
+        self.clip_ring.truncate(CLIP_HISTORY_MAX);
+    }
+
+    // ---- clipboard history dialog -------------------------------------
+
+    pub fn open_clipboard_dialog(&mut self) {
+        self.open_dialog(Dialog::Clipboard);
+    }
+
+    pub fn clip_move(&mut self, delta: i32) {
+        let n = self.clip_ring.len();
+        if n == 0 {
+            return;
+        }
+        self.clip_cursor = (self.clip_cursor as i32 + delta).rem_euclid(n as i32) as usize;
+    }
+
+    /// Paste the selected entry into whatever had focus underneath, and make it
+    /// the system clipboard so a plain ⌘V repeats it.
+    pub fn clip_paste_selected(&mut self) {
+        let Some(entry) = self.clip_ring.get(self.clip_cursor).cloned() else {
+            return;
+        };
+        // The dialog below this one says where the text should land: the
+        // history palette is stacked *on top of* whatever the user was in.
+        let below = self.dialogs.iter().rev().nth(1).copied();
+        self.close_top_dialog();
+        self.set_clipboard(entry.text.clone());
+        let n = entry.text.chars().count();
+        match below {
+            Some(Dialog::Terminal) => {
+                if let Some(term) = self.active_terminal_mut() {
+                    term.paste(&entry.text);
+                }
+            }
+            _ => {
+                if let Some(buf) = self.active_buffer() {
+                    buf.insert_str(&entry.text);
+                } else {
+                    self.notify("Nothing open to paste into", ToastKind::Info);
+                    return;
+                }
+            }
+        }
+        self.notify(format!("Pasted {n} chars"), ToastKind::Success);
+    }
+
+    /// Forget the whole history — the escape hatch for "I just copied a
+    /// password".
+    pub fn clip_clear(&mut self) {
+        let n = self.clip_ring.len();
+        self.clip_ring.clear();
+        self.clip_cursor = 0;
+        self.notify(format!("Cleared {n} clipboard entries"), ToastKind::Info);
+    }
+
+    // ---- to-do list ---------------------------------------------------
+
+    pub fn open_todos_dialog(&mut self) {
+        self.open_dialog(Dialog::Todos);
+    }
+
+    /// Re-read the file every time the dialog opens: it's the source of truth,
+    /// and it may well have been edited as a tab (or by another Oxru window)
+    /// since we last looked.
+    fn init_todos(&mut self) {
+        self.todos = self
+            .todos_path
+            .as_deref()
+            .map(crate::todo::load_from)
+            .unwrap_or_default();
+        self.todo_cursor = crate::todo::first_task(&self.todos).unwrap_or(0);
+        self.todo_input.clear();
+        self.todo_input_cursor = 0;
+        self.todo_input_anchor = None;
+    }
+
+    fn save_todos(&mut self) {
+        let Some(path) = self.todos_path.clone() else {
+            return; // no store configured (tests) — nothing to persist to
+        };
+        if let Err(e) = crate::todo::save_to(&path, &self.todos) {
+            self.notify(format!("Couldn't save to-dos: {e}"), ToastKind::Error);
+        }
+    }
+
+    pub fn todo_move(&mut self, delta: i32) {
+        if let Some(i) = crate::todo::next_task(&self.todos, self.todo_cursor, delta) {
+            self.todo_cursor = i;
+        }
+    }
+
+    /// Commit the input line as a new task.
+    pub fn todo_add(&mut self) {
+        let text = std::mem::take(&mut self.todo_input);
+        self.todo_input_cursor = 0;
+        self.todo_input_anchor = None;
+        if text.trim().is_empty() {
+            return;
+        }
+        crate::todo::add(&mut self.todos, &text);
+        self.todo_cursor = self.todos.len() - 1;
+        self.save_todos();
+    }
+
+    /// Paste into the to-do list.
+    ///
+    /// A single line goes into the input box, like any other text field. A
+    /// *multi-line* paste becomes one task per line, run through the same
+    /// forgiving parser the file uses — so pasting
+    ///
+    /// ```text
+    /// - search a word in all files
+    /// - copying multiples in clipboard?
+    /// ```
+    ///
+    /// adds two tasks with the bullets stripped, rather than mangling it all
+    /// into one input line (which is what a plain text field would do, and what
+    /// made a paste look like it did nothing at all).
+    pub fn todo_paste(&mut self) {
+        let text = self.get_clipboard();
+        if text.trim().is_empty() {
+            return;
+        }
+
+        // Single line: ordinary insert-at-cursor.
+        if !text.trim().contains('\n') {
+            let one = one_line(text);
+            crate::editline::insert_str(
+                &mut self.todo_input,
+                &mut self.todo_input_cursor,
+                &mut self.todo_input_anchor,
+                &one,
+            );
+            return;
+        }
+
+        // Multi-line: whatever is half-typed in the input is a task too, so it
+        // isn't silently dropped by the paste that follows it.
+        self.todo_add();
+        let added: Vec<crate::todo::Entry> = crate::todo::parse(&text)
+            .into_iter()
+            .filter(crate::todo::Entry::is_task)
+            .collect();
+        if added.is_empty() {
+            return;
+        }
+        let n = added.len();
+        self.todos.extend(added);
+        self.todo_cursor = self.todos.len() - 1;
+        self.save_todos();
+        self.notify(format!("Added {n} tasks"), ToastKind::Success);
+    }
+
+    pub fn todo_toggle(&mut self) {
+        crate::todo::toggle(&mut self.todos, self.todo_cursor);
+        self.save_todos();
+    }
+
+    pub fn todo_remove(&mut self) {
+        if !self.todos.get(self.todo_cursor).is_some_and(crate::todo::Entry::is_task) {
+            return;
+        }
+        crate::todo::remove(&mut self.todos, self.todo_cursor);
+        // Keep the cursor on a task: try forward first, then back, so deleting
+        // the last item doesn't strand it past the end.
+        self.todo_cursor = crate::todo::next_task(&self.todos, self.todo_cursor.saturating_sub(1), 1)
+            .or_else(|| crate::todo::first_task(&self.todos))
+            .unwrap_or(0);
+        self.save_todos();
+    }
+
+    pub fn todo_clear_done(&mut self) {
+        let n = crate::todo::clear_done(&mut self.todos);
+        if n == 0 {
+            self.notify("Nothing completed to clear", ToastKind::Info);
+            return;
+        }
+        self.todo_cursor = crate::todo::first_task(&self.todos).unwrap_or(0);
+        self.save_todos();
+        self.notify(format!("Cleared {n} completed"), ToastKind::Success);
+    }
+
+    /// Open the to-do file as an ordinary editor tab. This *is* the "edit as
+    /// plain text" feature — rather than a cut-down text box inside the dialog,
+    /// you get the real editor, undo and all, on the real file.
+    pub fn todo_edit_as_file(&mut self) {
+        let Some(path) = self.todos_path.clone() else {
+            self.notify("No config directory to store to-dos in", ToastKind::Error);
+            return;
+        };
+        // Create it first: opening a non-existent path would just error.
+        if !path.exists() {
+            if let Err(e) = crate::todo::save_to(&path, &self.todos) {
+                self.notify(format!("Couldn't create the to-do file: {e}"), ToastKind::Error);
+                return;
+            }
+        }
+        self.close_top_dialog();
+        self.open_path(&path);
     }
 
     /// Read the clipboard, preferring the system clipboard.
@@ -3194,6 +3494,7 @@ impl App {
                 self.mouse_to_app = false;
             } else {
                 self.terminal_mouse_up();
+                self.terminal_click(col, row);
             }
         } else {
             self.editor_mouse_up();
@@ -3213,19 +3514,26 @@ impl App {
 
     /// Mouse wheel: `lines` > 0 is wheel-up (toward history / page top).
     pub fn mouse_wheel(&mut self, lines: i32, col: u16, row: u16, shift: bool) {
-        // Unlike mouse_down/up/move, this used to skip the dialog check entirely
-        // and scroll straight through to whatever editor tab was active — so
-        // wheeling over the Files dialog's list (a very natural way to browse
-        // search results) silently dragged the *background* editor's scroll
-        // position around instead. If a newly-opened file happened to land in
-        // that same active-editor slot moments later (or trailing trackpad
-        // momentum kept delivering wheel deltas for a bit after Enter/click
-        // closed the dialog), it would open already scrolled away from the top
-        // instead of at row 0. Route to the dialog like every other mouse method
-        // does whenever one is on top.
-        if !self.prompt.active && self.top_dialog() == Some(Dialog::Files) {
-            self.dialog_wheel(lines);
-            return;
+        // Whatever dialog is on top owns the wheel. This used to be wired for
+        // the Files dialog alone, so wheeling over Search-in-Files, Recent,
+        // Help, Settings, the to-do list or the clipboard silently scrolled the
+        // *editor behind them* instead — worse than doing nothing, because it
+        // dragged an unrelated file's scroll position around while you thought
+        // you were browsing results.
+        if !self.prompt.active {
+            match self.top_dialog() {
+                // The terminal pane scrolls its own scrollback (and forwards to
+                // a full-screen program when one owns the alternate screen).
+                Some(Dialog::Terminal) => {
+                    self.terminal_wheel(lines, col, row, shift);
+                    return;
+                }
+                Some(d) => {
+                    self.dialog_wheel(d, lines);
+                    return;
+                }
+                None => {}
+            }
         }
         if self.terminal_focused() {
             self.terminal_wheel(lines, col, row, shift);
@@ -3235,16 +3543,42 @@ impl App {
         }
     }
 
-    /// Move the Files dialog's selection by the wheel amount (matches
-    /// `terminal_wheel`'s step-and-cap convention) instead of falling through
-    /// to the editor behind it.
-    fn dialog_wheel(&mut self, lines: i32) {
-        let n = (lines.unsigned_abs() as usize).min(10);
-        for _ in 0..n {
-            if lines > 0 {
-                self.dialog_up();
-            } else {
-                self.dialog_down();
+    /// Move `d`'s selection by the wheel amount, using that dialog's own
+    /// navigation so the cursor, scroll offset and any follow-on work (the
+    /// Files dialog's preview, say) stay consistent with keyboard use.
+    ///
+    /// Capped at 10 steps per event, matching `terminal_wheel`, so a flick of a
+    /// trackpad can't fling a list end to end.
+    fn dialog_wheel(&mut self, d: Dialog, lines: i32) {
+        let steps = (lines.unsigned_abs() as usize).min(10);
+        let up = lines > 0;
+        let delta = if up { -1 } else { 1 };
+        for _ in 0..steps {
+            match d {
+                Dialog::Files => {
+                    if up {
+                        self.dialog_up()
+                    } else {
+                        self.dialog_down()
+                    }
+                }
+                Dialog::SearchFiles => {
+                    if up {
+                        self.search_files_up()
+                    } else {
+                        self.search_files_down()
+                    }
+                }
+                Dialog::Recent => self.recent_move(delta),
+                Dialog::TerminalPicker => self.terminal_picker_move(delta),
+                Dialog::Todos => self.todo_move(delta),
+                Dialog::Clipboard => self.clip_move(delta),
+                Dialog::Help => self.help_scroll(delta),
+                // Settings is a short list of controls rather than a scrolling
+                // view; the wheel walks the focused section, and is swallowed
+                // either way so it can't reach the editor underneath.
+                Dialog::Settings => self.settings_move_focus(delta),
+                Dialog::Terminal => {}
             }
         }
     }
@@ -3530,6 +3864,58 @@ impl App {
     pub fn terminal_mouse_up(&mut self) {
         self.terminal_dragging = false;
         self.terminal_drag_last = None;
+    }
+
+    /// A left-click that finished on the cell it started on, without becoming a
+    /// drag. Offers the URL under it, if there is one.
+    ///
+    /// Checked on *release* rather than press, and only when nothing was
+    /// selected, so it can never interrupt a text selection — a drag that
+    /// happens to start on a link still selects, as it always did.
+    pub fn terminal_click(&mut self, col: u16, row: u16) {
+        if self.prompt.active {
+            return;
+        }
+        let selecting = self
+            .terminals
+            .get(self.active_terminal)
+            .is_some_and(|t| t.selection_active());
+        if selecting {
+            return;
+        }
+        let Some((r, c)) = self.terminal_local(col, row) else {
+            return;
+        };
+        let url = self.terminals.get(self.active_terminal).and_then(|t| t.url_at(r, c));
+        if let Some(url) = url {
+            self.offer_url(url);
+        }
+    }
+
+    /// A click landed on a URL in the terminal — ask before going anywhere.
+    ///
+    /// Never opens on the click itself. The text came from whatever the
+    /// terminal happened to print, which is not something a single click should
+    /// be able to act on, so the URL is shown in full and the user decides.
+    fn offer_url(&mut self, url: String) {
+        self.prompt.open_confirm(
+            crate::prompt::PromptKind::OpenUrl,
+            format!("Open in your browser?  {url}"),
+        );
+        self.pending_url = Some(url);
+    }
+
+    /// Answer the open-link prompt. `open` false (Esc / N) just dismisses.
+    pub fn open_url_answer(&mut self, open: bool) {
+        let url = self.pending_url.take();
+        self.prompt.close();
+        let Some(url) = url.filter(|_| open) else {
+            return;
+        };
+        match open_in_browser(&url) {
+            Ok(()) => self.notify("Opened in your browser", ToastKind::Success),
+            Err(e) => self.notify(format!("Couldn't open the link: {e}"), ToastKind::Error),
+        }
     }
 
     /// Copy the active terminal's current selection to the clipboard.
@@ -3837,7 +4223,34 @@ impl App {
             .filter(|l| !l.is_empty())
             .collect();
         for cmd in cmds {
-            self.open_terminal_with_command(&cmd);
+            if cmd == crate::termbridge::SHELL_REQUEST {
+                // `open -a Terminal` with nothing to run — just a shell.
+                self.new_terminal();
+                self.terminal_modal = true;
+            } else {
+                self.open_terminal_with_command(&cmd);
+            }
+        }
+        self.log_terminal_passthroughs();
+    }
+
+    /// Drain the shims' record of calls they let through to the real
+    /// `osascript` / `open`. Anything here is something that *could* have
+    /// opened a real window; logging it turns "a script still opens a terminal
+    /// sometimes" from a guess into a line naming the exact command.
+    fn log_terminal_passthroughs(&mut self) {
+        let Some(path) = crate::termbridge::passthrough_file() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let _ = std::fs::write(&path, b"");
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            tracing::info!(call = %line, "shim let a call through to the real binary");
         }
     }
 
@@ -4229,7 +4642,8 @@ impl App {
             | PromptKind::CloseTab
             | PromptKind::QuitUnsaved
             | PromptKind::QuitTerminal
-            | PromptKind::ExternalChange => return,
+            | PromptKind::ExternalChange
+            | PromptKind::OpenUrl => return,
         };
 
         self.status = match result {
@@ -4334,9 +4748,35 @@ fn read_git_status(root: &Path) -> Option<(String, bool)> {
     Some((branch.to_string(), dirty))
 }
 
+/// Hand `url` to the system's default browser.
+///
+/// The URL is passed as a separate argument, never interpolated into a shell
+/// command line, so nothing in it can be read as shell syntax. Callers must
+/// have already established that it's http(s) — see
+/// [`crate::terminalpane::url_span_at`].
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    debug_assert!(url.starts_with("http://") || url.starts_with("https://"));
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    cmd.arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
 /// The folder name used to label a plain terminal (the project root's basename,
 /// or "shell" for a root with no name like "/").
-fn folder_name(root: &Path) -> String {
+pub(crate) fn folder_name(root: &Path) -> String {
     root.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
@@ -5653,6 +6093,228 @@ mod tests {
         assert_eq!(app.repaint_interval(), Duration::from_millis(16));
     }
 
+    /// The to-do dialog is a *view over the file*: everything it does must be
+    /// on disk immediately, so a crash (or another window) can't lose it.
+    #[test]
+    fn todo_add_toggle_and_clear_write_through_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("todos.md");
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+
+        // Drive the model the way the dialog does, then persist to our own
+        // path (the real one is a per-machine config dir).
+        crate::todo::add(&mut app.todos, "write the parser");
+        crate::todo::add(&mut app.todos, "wire the dialog");
+        crate::todo::save_to(&path, &app.todos).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "- [ ] write the parser\n- [ ] wire the dialog\n"
+        );
+
+        crate::todo::toggle(&mut app.todos, 0);
+        crate::todo::save_to(&path, &app.todos).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "- [x] write the parser\n- [ ] wire the dialog\n"
+        );
+
+        assert_eq!(crate::todo::clear_done(&mut app.todos), 1);
+        crate::todo::save_to(&path, &app.todos).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "- [ ] wire the dialog\n");
+    }
+
+    #[test]
+    fn todo_cursor_stays_on_a_task_after_deleting_the_last_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.todos = crate::todo::parse("# H\n- [ ] a\n- [ ] b\n");
+        app.todo_cursor = 2; // the last task
+        app.todo_remove();
+        assert!(
+            app.todos.get(app.todo_cursor).is_some_and(crate::todo::Entry::is_task),
+            "the cursor must not be left on the heading or past the end"
+        );
+    }
+
+    /// Every copy in the app funnels through `set_clipboard`, so the history
+    /// picks up editor copies, terminal copies and copy-path alike.
+    #[test]
+    fn copying_feeds_the_clipboard_history_newest_first() {
+        let dir = workspace();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.open_path(&dir.path().join("src/main.rs"));
+        app.select_all();
+        app.copy_selection();
+        assert_eq!(app.clip_ring.len(), 1);
+        assert!(app.clip_ring[0].text.contains("fn main"));
+
+        app.copy_active_path(false);
+        assert_eq!(app.clip_ring.len(), 2);
+        assert!(app.clip_ring[0].text.contains("main.rs"), "newest first");
+    }
+
+    #[test]
+    fn copying_the_same_text_twice_moves_it_up_rather_than_duplicating() {
+        let dir = workspace();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.set_clipboard("one".into());
+        app.set_clipboard("two".into());
+        app.set_clipboard("one".into());
+        assert_eq!(app.clip_ring.len(), 2, "no duplicate entry");
+        assert_eq!(app.clip_ring[0].text, "one", "the repeat moved to the front");
+    }
+
+    #[test]
+    fn the_clipboard_history_is_capped_and_skips_blank_copies() {
+        let dir = workspace();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        for i in 0..(super::CLIP_HISTORY_MAX + 10) {
+            app.set_clipboard(format!("entry {i}"));
+        }
+        assert_eq!(app.clip_ring.len(), super::CLIP_HISTORY_MAX);
+        let before = app.clip_ring.len();
+        app.set_clipboard("   \n ".into());
+        assert_eq!(app.clip_ring.len(), before, "whitespace-only copies aren't remembered");
+    }
+
+    #[test]
+    fn pasting_from_history_inserts_into_the_editor_and_sets_the_clipboard() {
+        let dir = workspace();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.open_path(&dir.path().join("src/main.rs"));
+        app.set_clipboard("PASTED".into());
+        app.open_clipboard_dialog();
+        app.clip_cursor = 0;
+        app.clip_paste_selected();
+
+        assert!(app.active_buffer().unwrap().rope.to_string().contains("PASTED"));
+        assert_eq!(app.top_dialog(), None, "the dialog closes after pasting");
+        assert_eq!(app.clipboard_text, "PASTED", "so a plain paste repeats it");
+    }
+
+    #[test]
+    fn clearing_the_clipboard_history_empties_it() {
+        let dir = workspace();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.set_clipboard("secret".into());
+        assert!(!app.clip_ring.is_empty());
+        app.clip_clear();
+        assert!(app.clip_ring.is_empty(), "the escape hatch actually empties it");
+    }
+
+    /// The test build must never write to the machine's real to-do file. This
+    /// caught a live bug: `save_todos` resolved the config dir itself, so any
+    /// test driving the dialog silently overwrote the developer's own list.
+    #[test]
+    fn the_test_build_has_no_todo_store_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        assert!(app.todos_path.is_none(), "no store configured under cfg(test)");
+
+        // Mutating with no store is a no-op, not a panic and not a write.
+        crate::todo::add(&mut app.todos, "must not reach disk");
+        app.todo_toggle();
+        app.todo_clear_done();
+        if let Some(real) = crate::todo::todos_path() {
+            let after = std::fs::read_to_string(&real).unwrap_or_default();
+            assert!(
+                !after.contains("must not reach disk"),
+                "a test wrote into the real to-do file at {}",
+                real.display()
+            );
+        }
+    }
+
+    /// Wheeling over a dialog scrolls *that dialog*, never the editor behind
+    /// it. The regression this pins: only the Files dialog was wired, so a
+    /// wheel over Search-in-Files, Recent, Help, the to-do list or the
+    /// clipboard quietly scrolled the background file instead.
+    #[test]
+    fn the_wheel_scrolls_the_dialog_on_top_not_the_editor_behind_it() {
+        let dir = workspace();
+        // A file long enough that the editor's scroll position can move.
+        let long = dir.path().join("src/long.rs");
+        std::fs::write(&long, (0..400).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+
+        for d in [
+            Dialog::Files,
+            Dialog::Recent,
+            Dialog::Settings,
+            Dialog::Help,
+            Dialog::SearchFiles,
+            Dialog::Todos,
+            Dialog::Clipboard,
+        ] {
+            let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+            app.open_path(&long);
+            // `open_path` arms a short grace period that makes the editor
+            // ignore the wheel (so trackpad momentum can't scroll a file the
+            // instant it opens). Clear it, or this test can't tell a leak from
+            // that guard and silently proves nothing.
+            app.just_opened = None;
+            app.open_dialog(d);
+            let before = app.editors[app.active_editor.unwrap()].scroll_row;
+
+            for _ in 0..5 {
+                app.mouse_wheel(-3, 10, 10, false); // wheel down
+            }
+            let after = app.editors[app.active_editor.unwrap()].scroll_row;
+            assert_eq!(
+                before, after,
+                "{d:?}: the wheel leaked through and scrolled the editor behind it"
+            );
+        }
+    }
+
+    /// …and it actually moves each list, rather than being swallowed silently.
+    #[test]
+    fn the_wheel_moves_the_selection_in_every_list_dialog() {
+        let dir = workspace();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+
+        // Search in Files: seed several results.
+        app.open_search_files();
+        for c in "line".chars() {
+            app.search_files_input(c);
+        }
+        app.project_search.pending_search_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        app.poll_pending_search();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !app.poll_search_results() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if app.project_search.results.len() > 1 {
+            let before = app.project_search.selected;
+            app.mouse_wheel(-1, 10, 10, false);
+            assert_ne!(before, app.project_search.selected, "Search in Files must scroll");
+        }
+        app.close_top_dialog();
+
+        // To-do list.
+        app.todos = crate::todo::parse("- [ ] a\n- [ ] b\n- [ ] c\n");
+        app.open_dialog(Dialog::Todos);
+        app.todos = crate::todo::parse("- [ ] a\n- [ ] b\n- [ ] c\n");
+        app.todo_cursor = 0;
+        app.mouse_wheel(-1, 10, 10, false);
+        assert_eq!(app.todo_cursor, 1, "the to-do list must scroll");
+        app.close_top_dialog();
+
+        // Clipboard history.
+        app.set_clipboard("one".into());
+        app.set_clipboard("two".into());
+        app.open_clipboard_dialog();
+        app.clip_cursor = 0;
+        app.mouse_wheel(-1, 10, 10, false);
+        assert_eq!(app.clip_cursor, 1, "the clipboard history must scroll");
+        app.close_top_dialog();
+
+        // Help sheet.
+        app.open_help();
+        app.mouse_wheel(-3, 10, 10, false);
+        assert!(app.help_scroll > 0, "the F1 sheet must scroll");
+    }
+
     #[test]
     fn folder_name_uses_basename() {
         assert_eq!(folder_name(Path::new("/a/b/myproj")), "myproj");
@@ -6107,6 +6769,203 @@ mod tests {
         assert!(
             app.terminals[i].take_sent().is_empty(),
             "shift+click must select locally, not reach the program"
+        );
+    }
+
+    /// End-to-end through the real app path: a terminal opened the way the app
+    /// opens it, a `cd` typed the way the user types it, and the tab strip's
+    /// own label function. The pane-level test covers the mechanism; this one
+    /// covers the wiring around it.
+    #[test]
+    fn the_terminal_tab_label_follows_a_cd() {
+        let (dir, mut app) = terminal_mouse_app();
+        let start_name = folder_name(dir.path());
+        let target = dir.path().join("some-other-repo");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let i = app.active_terminal;
+        assert_eq!(
+            app.terminal_labels()[i],
+            start_name,
+            "the tab starts out naming the folder the terminal opened in"
+        );
+
+        app.terminals[i].send_input(format!("cd '{}'\n", target.display()).as_bytes());
+
+        let want = folder_name(&target);
+        let moved = pump_until(&mut app, |t| t.folder == want);
+
+        // `process_cwd` only has an implementation on macOS; elsewhere the
+        // label legitimately can't move, so there's nothing to assert.
+        if cfg!(target_os = "macos") {
+            assert!(moved, "the tab label never followed the cd");
+            assert_eq!(
+                app.terminal_labels()[i],
+                want,
+                "the tab strip should name the folder the shell is actually in"
+            );
+        }
+    }
+
+    /// The first screen cell of `needle`, as `(row, col)` within the terminal.
+    fn find_cell(t: &crate::terminalpane::TerminalPane, needle: &str) -> Option<(u16, u16)> {
+        let screen = t.screen();
+        let (rows, cols) = screen.size();
+        for r in 0..rows {
+            let line: String = (0..cols)
+                .map(|c| screen.cell(r, c).map(|x| x.contents()).unwrap_or_default())
+                .map(|s| if s.is_empty() { " ".to_string() } else { s.to_string() })
+                .collect();
+            if let Some(byte) = line.find(needle) {
+                return Some((r, line[..byte].chars().count() as u16));
+            }
+        }
+        None
+    }
+
+    /// Clicking a link asks first and never opens on its own.
+    #[test]
+    fn clicking_a_link_in_the_terminal_asks_before_opening() {
+        let (_d, mut app) = terminal_mouse_app();
+        let i = app.active_terminal;
+        app.terminals[i].send_input(b"printf 'see https://example.com/PICKME here\\n'");
+        app.terminals[i].send_input(b"\n");
+        assert!(pump_until(&mut app, |t| screen_has(t, "https://example.com/PICKME")));
+
+        // Find the cell the URL is on and click it.
+        let (r, c) = find_cell(&app.terminals[i], "example.com").expect("url on screen");
+        let (vx, vy, _, _) = app.terminal_view.unwrap();
+        app.mouse_down(vx + c, vy + r, false, false);
+        app.mouse_up(vx + c, vy + r);
+
+        assert!(app.prompt.active, "a click on a link must raise the confirmation");
+        assert_eq!(app.prompt.kind(), Some(crate::prompt::PromptKind::OpenUrl));
+        assert!(
+            app.prompt.title().contains("https://example.com/PICKME"),
+            "the prompt shows the full URL so you can see where you're going, got {:?}",
+            app.prompt.title()
+        );
+        assert_eq!(app.pending_url.as_deref(), Some("https://example.com/PICKME"));
+
+        // Cancelling opens nothing and clears the pending link.
+        app.open_url_answer(false);
+        assert!(!app.prompt.active);
+        assert!(app.pending_url.is_none(), "a cancelled link must not linger");
+    }
+
+    #[test]
+    fn clicking_plain_text_in_the_terminal_does_nothing() {
+        let (_d, mut app) = terminal_mouse_app();
+        let i = app.active_terminal;
+        app.terminals[i].send_input(b"printf 'just some PICKME output\\n'\n");
+        assert!(pump_until(&mut app, |t| screen_has(t, "PICKME")));
+
+        let (r, c) = find_cell(&app.terminals[i], "PICKME").expect("text on screen");
+        let (vx, vy, _, _) = app.terminal_view.unwrap();
+        app.mouse_down(vx + c, vy + r, false, false);
+        app.mouse_up(vx + c, vy + r);
+        assert!(!app.prompt.active, "ordinary text must not prompt");
+    }
+
+    /// Selecting text is still selecting text — a drag that happens to start on
+    /// a link must not turn into a "open this?" prompt on release.
+    #[test]
+    fn dragging_across_a_link_selects_instead_of_offering_it() {
+        let (_d, mut app) = terminal_mouse_app();
+        let i = app.active_terminal;
+        app.terminals[i].send_input(b"printf 'see https://example.com/PICKME here\\n'\n");
+        assert!(pump_until(&mut app, |t| screen_has(t, "https://example.com/PICKME")));
+
+        let (r, c) = find_cell(&app.terminals[i], "example.com").expect("url on screen");
+        let (vx, vy, _, _) = app.terminal_view.unwrap();
+        app.mouse_down(vx + c, vy + r, false, false);
+        app.mouse_drag(vx + c + 8, vy + r);
+        app.mouse_up(vx + c + 8, vy + r);
+
+        assert!(!app.prompt.active, "a drag is a selection, not a click on a link");
+        assert!(app.terminals[i].selection_text().is_some(), "and it selected");
+    }
+
+    /// Marking text with the mouse while scrolled up must not restart the
+    /// auto-scroll — the reported bug.
+    #[test]
+    fn selecting_with_the_mouse_does_not_break_scroll_lock() {
+        let (_d, mut app) = terminal_mouse_app();
+        let i = app.active_terminal;
+        app.terminals[i].send_input(b"for n in $(seq 1 60); do echo \"LINE-$n\"; done\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            app.terminals[i].pump();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        app.terminals[i].scroll_lines(15);
+        let before = term_text(&app.terminals[i]);
+
+        // Drag out a selection, the way a user marks text.
+        let (vx, vy, _, _) = app.terminal_view.unwrap();
+        app.mouse_down(vx + 2, vy + 5, false, false);
+        app.mouse_drag(vx + 30, vy + 8);
+        app.mouse_up(vx + 30, vy + 8);
+        assert!(app.terminals[i].selection_text().is_some(), "something is marked");
+        assert_eq!(term_text(&app.terminals[i]), before, "marking moved the view");
+
+        // Now stream output past the selection.
+        app.terminals[i].send_input(b"for n in $(seq 1 80); do echo \"NOISE-$n\"; done\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            app.terminals[i].pump();
+            app.mouse_drag_tick();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            term_text(&app.terminals[i]),
+            before,
+            "the view scrolled after marking text"
+        );
+    }
+
+    fn term_text(t: &crate::terminalpane::TerminalPane) -> String {
+        let screen = t.screen();
+        let (rows, cols) = screen.size();
+        (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| screen.cell(r, c).map(|x| x.contents()).unwrap_or_default())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Marking with Shift+arrows (the "Mark" chord) while scrolled up must not
+    /// snap the view back to the bottom.
+    #[test]
+    fn shift_arrow_marking_does_not_snap_to_the_bottom() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_d, mut app) = terminal_mouse_app();
+        let i = app.active_terminal;
+        app.terminals[i].send_input(b"for n in $(seq 1 60); do echo \"LINE-$n\"; done\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            app.terminals[i].pump();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        app.terminals[i].scroll_lines(15);
+        let offset = app.terminals[i].scroll_offset();
+        assert!(offset > 0, "scrolled up");
+
+        // Mark a few cells with Shift+arrows.
+        for _ in 0..5 {
+            crate::input::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            );
+        }
+        assert_eq!(
+            app.terminals[i].scroll_offset(),
+            offset,
+            "marking snapped the view back to the bottom"
         );
     }
 

@@ -107,6 +107,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Dialog::Recent => render_recent(f, area, app, below),
             Dialog::Help => render_help(f, area, app, below),
             Dialog::SearchFiles => render_search_files(f, area, app, below),
+            Dialog::Todos => render_todos(f, area, app, below),
+            Dialog::Clipboard => render_clipboard(f, area, app, below),
         }
     }
     app.theme = base_theme;
@@ -187,9 +189,15 @@ fn render_toast(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn conv_color(c: vt100::Color, default: Color) -> Color {
+fn conv_color(c: vt100::Color, default: Color, t: &Theme) -> Color {
     match c {
         vt100::Color::Default => default,
+        // The first 16 are the ANSI colours, and Oxru resolves them itself
+        // rather than letting the backend fall back to its hardcoded xterm
+        // table — see `theme::ANSI_PALETTE` for why that table is unusable.
+        // 16-255 (the 6x6x6 cube and the greyscale ramp) are already sane and
+        // pass straight through.
+        vt100::Color::Idx(i) if (i as usize) < t.ansi.len() => t.ansi[i as usize],
         vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
@@ -261,7 +269,10 @@ fn render_terminal_modal(f: &mut Frame, area: Rect, app: &mut App, _below: usize
             title,
             Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(t.bg));
+        // The whole modal sits on the terminal surface, so the area around and
+        // between panes matches the panes themselves rather than showing a
+        // darker frame through the gaps.
+        .style(Style::default().bg(t.terminal_bg));
     let inner = outer.inner(rect);
     f.render_widget(outer, rect);
 
@@ -357,32 +368,32 @@ fn render_terminal_modal(f: &mut Frame, area: Rect, app: &mut App, _below: usize
     } else {
         // These are all handled locally by the embedded terminal's own key
         // handling (see `input::handle_terminal_modal`), which deliberately
-        // stays exempt from the TUI 3-key rule to keep behaving like a real
+        // keeps its own literal chords to keep behaving like a real
         // terminal app — so they're always shown in their 2-key GUI style,
         // regardless of `app.gui`. Quit is the one exception: it's the
         // global ⌘Q, not a terminal-local binding, so it does follow
         // `app.gui`.
         let mut actions: Vec<(String, String)> = vec![
-            (alt_str("N", true), "New".into()),
-            (alt_str("W", true), "Close".into()),
+            (alt_str("N"), "New".into()),
+            (alt_str("W"), "Close".into()),
         ];
         if app.terminals.len() > 1 {
             // Switching / moving mirror the editor tabs (Ctrl+Tab, Ctrl+Shift+,/.).
-            actions.push((ctrl_str("Tab", true), "Next".into()));
-            actions.push((ctrl_str("\u{21e7}Tab", true), "Prev".into()));
-            actions.push((ctrl_str("\u{21e7}\u{2194}", true), "Move".into()));
-            actions.push((alt_str("G", true), if app.terminal_grid { "Tabs".into() } else { "Grid".into() }));
-            actions.push((cmd_str("K", true), "Switch\u{2026}".into()));
-            actions.push((cmd_str("1-9", true), "Jump to tab".into()));
+            actions.push((ctrl_str("Tab"), "Next".into()));
+            actions.push((ctrl_str("\u{21e7}Tab"), "Prev".into()));
+            actions.push((ctrl_str("\u{21e7}\u{2194}"), "Move".into()));
+            actions.push((alt_str("G"), if app.terminal_grid { "Tabs".into() } else { "Grid".into() }));
+            actions.push((cmd_str("K"), "Switch\u{2026}".into()));
+            actions.push((cmd_str("1-9"), "Jump to tab".into()));
         }
-        actions.push((alt_str("T", true), "Hide".into()));
+        actions.push((alt_str("T"), "Hide".into()));
         actions.push(("\u{2325}\u{2190}\u{2192} \u{2325}\u{232b}".into(), "Word edit".into()));
         actions.push(("\u{21e7}\u{2190}\u{2191}\u{2193}\u{2192}".into(), "Mark".into()));
-        actions.push((alt_str("\u{2191}", true), "Select mode".into()));
+        actions.push((alt_str("\u{2191}"), "Select mode".into()));
         actions.push(("\u{21e7}PgUp/Dn".into(), "Scroll".into()));
         actions.push((copy_key.into(), "Copy".into()));
         actions.push((paste_key.into(), "Paste".into()));
-        actions.push((cmd_str("Q", app.gui), "Quit".into()));
+        actions.push((cmd_str("Q"), "Quit".into()));
         actions
     };
 
@@ -433,7 +444,7 @@ fn render_one_terminal(
                     .fg(if active { t.accent } else { t.fg_dim })
                     .add_modifier(Modifier::BOLD),
             ))
-            .style(Style::default().bg(t.bg));
+            .style(Style::default().bg(t.terminal_bg));
         let inner = block.inner(area);
         f.render_widget(block, area);
         inner
@@ -471,8 +482,8 @@ fn render_one_terminal(
                     let raw = cell.contents();
                     let contents = if raw.is_empty() { " " } else { raw };
                     let mut style = Style::default()
-                        .fg(conv_color(cell.fgcolor(), t.fg))
-                        .bg(conv_color(cell.bgcolor(), t.bg));
+                        .fg(conv_color(cell.fgcolor(), t.fg, t))
+                        .bg(conv_color(cell.bgcolor(), t.terminal_bg, t));
                     if cell.bold() {
                         style = style.add_modifier(Modifier::BOLD);
                     }
@@ -552,13 +563,7 @@ fn render_terminal_picker(f: &mut Frame, area: Rect, app: &App, below: usize) {
     let t = &app.theme;
     let labels = app.terminal_labels();
 
-    let list_len = app.terminal_picker.matches.len();
-    let visible = list_len.min(8).max(1);
-    let w = (area.width as u32 * 6 / 10).clamp(50, 90).min(area.width as u32) as u16;
-    let h = 4 + visible as u16; // border(2) + query(1) + divider(1) + rows
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = (area.y + area.height / 5 + below as u16).min(area.y + area.height.saturating_sub(h));
-    let rect = Rect::new(x, y, w, h.min(area.height));
+    let rect = dialog_rect_stacked(area, below, app.dialog_size_pct);
 
     f.render_widget(Clear, rect);
     let block = Block::default()
@@ -799,48 +804,39 @@ fn render_search_files(f: &mut Frame, area: Rect, app: &mut App, below: usize) {
     );
 }
 
-/// OS-styled Control chord for an arbitrary key label, e.g. `⌃Tab` / `Ctrl+Tab`
-/// in GUI mode. In TUI mode every Oxru shortcut (outside the embedded
-/// terminal, which is exempt — see `input::shortcut_mods`) needs a 3rd key:
-/// Ctrl/⌘-based ones additionally require Alt, shown appended (`⌃⌥Tab` /
-/// `Ctrl+Alt+Tab`) — a bare 2-key combo in a real terminal emulator can be
-/// intercepted before Oxru's own TUI event loop ever sees it.
-fn ctrl_str(key: &str, gui: bool) -> String {
-    match (cfg!(target_os = "macos"), gui) {
-        (true, true) => format!("\u{2303}{key}"),
-        (true, false) => format!("\u{2303}\u{2325}{key}"),
-        (false, true) => format!("Ctrl+{key}"),
-        (false, false) => format!("Ctrl+Alt+{key}"),
+/// OS-styled Control chord for an arbitrary key label, e.g. `⌃Tab` /
+/// `Ctrl+Tab`. Identical in both modes — see `input::shortcut_mods` for why
+/// the terminal build no longer shows (or requires) a different combo.
+fn ctrl_str(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("\u{2303}{key}")
+    } else {
+        format!("Ctrl+{key}")
     }
 }
 
-/// OS-styled Alt/Option chord, e.g. `⌥T` on macOS, `Alt+T` elsewhere, in GUI
-/// mode. In TUI mode Alt-based shortcuts additionally require Shift (`⌥⇧T` /
-/// `Alt+Shift+T`) — a different extra key than [`ctrl_str`] uses, so the two
-/// families never land on the same combo for the same letter.
-fn alt_str(key: &str, gui: bool) -> String {
-    match (cfg!(target_os = "macos"), gui) {
-        (true, true) => format!("\u{2325}{key}"),
-        (true, false) => format!("\u{2325}\u{21e7}{key}"),
-        (false, true) => format!("Alt+{key}"),
-        (false, false) => format!("Alt+Shift+{key}"),
+/// OS-styled Alt/Option chord, e.g. `⌥T` on macOS, `Alt+T` elsewhere.
+fn alt_str(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("\u{2325}{key}")
+    } else {
+        format!("Alt+{key}")
     }
 }
 
-/// Command-key notation (⌘ on macOS, "Ctrl+" elsewhere) for the shortcuts that
-/// fire on either ⌘ or Ctrl — see [`ctrl_str`] for the TUI 3rd-key behavior.
-/// Used for the letter/punctuation actions; tab switching keeps [`ctrl_str`]
-/// since ⌘Tab is reserved by macOS.
-fn cmd_str(key: &str, gui: bool) -> String {
-    match (cfg!(target_os = "macos"), gui) {
-        (true, true) => format!("\u{2318}{key}"),
-        (true, false) => format!("\u{2318}\u{2325}{key}"),
-        (false, true) => format!("Ctrl+{key}"),
-        (false, false) => format!("Ctrl+Alt+{key}"),
+/// Command-key notation (⌘ on macOS, `Ctrl+` elsewhere) for the shortcuts that
+/// fire on either ⌘ or Ctrl. Used for the letter/punctuation actions; tab
+/// switching keeps [`ctrl_str`] since ⌘Tab is reserved by macOS.
+fn cmd_str(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("\u{2318}{key}")
+    } else {
+        format!("Ctrl+{key}")
     }
 }
-fn cmd_key(letter: char, gui: bool) -> String {
-    cmd_str(&letter.to_ascii_uppercase().to_string(), gui)
+
+fn cmd_key(letter: char) -> String {
+    cmd_str(&letter.to_ascii_uppercase().to_string())
 }
 
 /// Draw a 1×1 block cursor showing `ch`. Used everywhere a text cursor is
@@ -1153,6 +1149,21 @@ fn dialog_rect_stacked(area: Rect, below: usize, pct: u32) -> Rect {
     Rect::new(x, y, w, h)
 }
 
+/// Rect for an *alert* — the rename / delete / save-before-close prompt, which
+/// asks one question and shouldn't bury the list it's asking about.
+///
+/// Width and horizontal placement come from [`dialog_rect_stacked`], the same
+/// source every dialog uses, so it lines up with them; only the height hugs
+/// the content. Every browsable dialog uses `dialog_rect_stacked` directly and
+/// takes the configured size in full — a short list leaves empty space, the
+/// same way the Files dialog does.
+fn dialog_rect_content(area: Rect, below: usize, pct: u32, content_rows: u16) -> Rect {
+    let full = dialog_rect_stacked(area, below, pct);
+    // At least 3 rows: a border pair plus one line of something.
+    let h = content_rows.clamp(3, full.height.max(3));
+    Rect::new(full.x, full.y, full.width, h.min(area.height))
+}
+
 /// The empty starting screen: a centred title and the two shortcuts.
 fn render_blank(f: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
@@ -1191,11 +1202,11 @@ fn render_blank(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
 
     if app.has_folder() {
-        lines.push(hint("Open files", alt_str("F", app.gui)));
-        lines.push(hint("Search in files", cmd_str("\u{21e7}F", app.gui)));
-        lines.push(hint("Open a folder", cmd_str("O", app.gui)));
-        lines.push(hint("Recent folders", alt_str("O", app.gui)));
-        lines.push(hint("New terminal", alt_str("T", app.gui)));
+        lines.push(hint("Open files", alt_str("F")));
+        lines.push(hint("Search in files", cmd_str("\u{21e7}F")));
+        lines.push(hint("Open a folder", cmd_str("O")));
+        lines.push(hint("Recent folders", alt_str("O")));
+        lines.push(hint("New terminal", alt_str("T")));
     } else {
         // No folder open — only show what actually works here. Files and the
         // terminal both need a folder, so they're hidden until one is open.
@@ -1204,12 +1215,12 @@ fn render_blank(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(t.fg_dim),
         )));
         lines.push(Line::from(""));
-        lines.push(hint("Open a folder", cmd_str("O", app.gui)));
-        lines.push(hint("Recent folders", alt_str("O", app.gui)));
+        lines.push(hint("Open a folder", cmd_str("O")));
+        lines.push(hint("Recent folders", alt_str("O")));
     }
-    lines.push(hint("Settings", cmd_str(",", app.gui)));
+    lines.push(hint("Settings", cmd_str(",")));
     lines.push(hint("Shortcuts", "F1".to_string()));
-    lines.push(hint("Quit", cmd_key('q', app.gui)));
+    lines.push(hint("Quit", cmd_key('q')));
 
     // Vertically centred as a block rather than pinned to a fixed row, so the
     // whole screen stays balanced whatever the window height is.
@@ -1509,48 +1520,46 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     // Shortcut hints, most-used first. They flow across the two footer rows; any
     // that don't fit are still in the F1 cheat-sheet. Tab switching stays on Ctrl
     // (⌘Tab is reserved by macOS).
-    let gui = app.gui;
     let mut hints: Vec<(String, &str)> = vec![
-        (cmd_key('s', gui), "Save"),
-        (cmd_key('f', gui), "Find"),
-        (cmd_key('z', gui), "Undo"),
-        (cmd_str("\u{21e7}Z", gui), "Redo"),
+        (cmd_key('s'), "Save"),
+        (cmd_key('f'), "Find"),
+        (cmd_key('z'), "Undo"),
+        (cmd_str("\u{21e7}Z"), "Redo"),
     ];
     hints.push(("\u{21e7}\u{2190}\u{2191}\u{2193}\u{2192}".to_string(), "Select"));
     if b.selection().is_some() {
-        hints.push((cmd_key('c', gui), "Copy"));
-        hints.push((cmd_key('x', gui), "Cut"));
+        hints.push((cmd_key('c'), "Copy"));
+        hints.push((cmd_key('x'), "Cut"));
     } else {
-        hints.push((cmd_key('a', gui), "Select all"));
+        hints.push((cmd_key('a'), "Select all"));
     }
-    hints.push((cmd_key('v', gui), "Paste"));
-    hints.push((cmd_str("\u{21e7}S", gui), "Save all"));
-    hints.push((cmd_key('w', gui), "Close"));
-    hints.push((cmd_str("\u{21e7}W", gui), "Close all"));
-    hints.push((cmd_str("\u{21e7}T", gui), "Reopen"));
-    hints.push((cmd_str("\\", gui), if app.editor_grid { "Unsplit" } else { "Split" }));
+    hints.push((cmd_key('v'), "Paste"));
+    hints.push((cmd_str("\u{21e7}S"), "Save all"));
+    hints.push((cmd_key('w'), "Close"));
+    hints.push((cmd_str("\u{21e7}W"), "Close all"));
+    hints.push((cmd_str("\u{21e7}T"), "Reopen"));
+    hints.push((cmd_str("\\"), if app.editor_grid { "Unsplit" } else { "Split" }));
     if app.editors.len() > 1 {
-        hints.push((ctrl_str("Tab", gui), "Switch"));
-        hints.push((ctrl_str("\u{21e7}\u{2194}", gui), "Move tab"));
+        hints.push((ctrl_str("Tab"), "Switch"));
+        hints.push((ctrl_str("\u{21e7}\u{2194}"), "Move tab"));
     }
     // Multi-cursor: ⌘D adds the next match; while several carets are live, show
     // how to add a column caret and how to collapse back to one. Add-caret is
-    // ⌘⌥↕ in GUI mode already — Ctrl+Alt is already the TUI 3-key shape, so
-    // unlike the other hints here it doesn't change between modes.
+    // ⌘⌥↕ — already multi-modifier, so it's written literally.
     if b.has_extra_carets() {
-        hints.push((cmd_str("\u{2325}\u{2195}", true), "Add caret"));
+        hints.push((cmd_str("\u{2325}\u{2195}"), "Add caret"));
         hints.push(("Esc".to_string(), "One caret"));
     } else {
-        hints.push((cmd_key('d', gui), "Multi-cursor"));
+        hints.push((cmd_key('d'), "Multi-cursor"));
     }
-    hints.push((cmd_str("\u{21e7}C", gui), "Copy path"));
-    hints.push((alt_str("F", gui), "Files"));
-    hints.push((cmd_str("\u{21e7}F", gui), "Search files"));
-    hints.push((alt_str("T", gui), "Term"));
-    hints.push((alt_str("Z", gui), if app.word_wrap { "Unwrap" } else { "Wrap" }));
-    hints.push((cmd_str(",", gui), "Settings"));
+    hints.push((cmd_str("\u{21e7}C"), "Copy path"));
+    hints.push((alt_str("F"), "Files"));
+    hints.push((cmd_str("\u{21e7}F"), "Search files"));
+    hints.push((alt_str("T"), "Term"));
+    hints.push((alt_str("Z"), if app.word_wrap { "Unwrap" } else { "Wrap" }));
+    hints.push((cmd_str(","), "Settings"));
     hints.push(("F1".to_string(), "Shortcuts"));
-    hints.push((cmd_key('q', gui), "Quit"));
+    hints.push((cmd_key('q'), "Quit"));
 
     // Status (left-aligned): position · language · line ending · indent ·
     // git branch (green = clean, yellow = uncommitted changes) · saved state
@@ -2348,18 +2357,214 @@ fn paint_range(
     }
 }
 
+/// The global to-do list (⌥D). A view over the markdown file, not a separate
+/// store: what's drawn here is what's in `todos.md`, and ⌃E opens that same
+/// file in a real editor tab.
+fn render_todos(f: &mut Frame, area: Rect, app: &App, below: usize) {
+    let t = &app.theme;
+    let rect = dialog_rect_stacked(area, below, app.dialog_size_pct);
+
+    let (done, total) = crate::todo::counts(&app.todos);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.accent))
+        .title(TSpan::styled(
+            format!(" To-do  {done}/{total} "),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(t.bg_dark));
+    let inner = pad_x(block.inner(rect), space::SM);
+    f.render_widget(block, rect);
+
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // 0 add-a-task input
+            Constraint::Length(1), // 1 divider
+            Constraint::Min(1),    // 2 list
+            Constraint::Length(1), // 3 divider
+            Constraint::Length(1), // 4 footer
+        ])
+        .split(inner);
+
+    // The input line, with a placeholder while it's empty so the dialog says
+    // what to do rather than showing a bare cursor.
+    f.render_widget(
+        Paragraph::new(Line::from(TSpan::styled(
+            "+ ",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        )))
+        .style(Style::default().bg(t.bg_dark)),
+        parts[0],
+    );
+    let field = Rect::new(parts[0].x + 2, parts[0].y, parts[0].width.saturating_sub(2), 1);
+    render_line_input(
+        f,
+        field,
+        &app.todo_input,
+        app.todo_input_cursor,
+        app.todo_input_anchor,
+        t.fg,
+        t,
+    );
+    if app.todo_input.is_empty() {
+        let hint = Rect::new(field.x + 1, field.y, field.width.saturating_sub(1), 1);
+        f.render_widget(
+            Paragraph::new(Line::from(TSpan::styled(
+                "type to add a task \u{00b7} \u{2318}V pastes a list",
+                Style::default().fg(crate::theme::mix(t.fg_dim, t.bg_dark, 0.35)),
+            )))
+            .style(Style::default().bg(t.bg_dark)),
+            hint,
+        );
+    }
+    render_divider(f, parts[1], t);
+
+    // The list. Headings render as headings; a done task is dimmed so the eye
+    // skips it the way a crossed-out line would.
+    let rows = crate::todo::visible_rows(&app.todos);
+    let list_h = parts[2].height as usize;
+    let cursor_row = rows.iter().position(|&i| i == app.todo_cursor).unwrap_or(0);
+    let start = cursor_row.saturating_sub(list_h.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    if rows.is_empty() {
+        lines.push(Line::from(TSpan::styled(
+            "Nothing yet — type above to add your first task.",
+            Style::default().fg(t.fg_dim),
+        )));
+    }
+    for &idx in rows.iter().skip(start).take(list_h) {
+        match &app.todos[idx] {
+            crate::todo::Entry::Task { done, text } => {
+                let on_cursor = idx == app.todo_cursor;
+                let base = if on_cursor {
+                    t.selection(true)
+                } else if *done {
+                    Style::default().fg(t.fg_dim)
+                } else {
+                    Style::default().fg(t.fg)
+                };
+                let box_style = if on_cursor {
+                    base
+                } else if *done {
+                    Style::default().fg(t.accent)
+                } else {
+                    Style::default().fg(t.fg_dim)
+                };
+                let mut spans = vec![
+                    TSpan::styled(" ", base),
+                    TSpan::styled(if *done { "[✓] " } else { "[ ] " }, box_style),
+                    TSpan::styled(text.clone(), base),
+                ];
+                // Pad the row so the selection highlight fills its width.
+                let used: usize = spans.iter().map(|s| s.width()).sum();
+                let pad = (parts[2].width as usize).saturating_sub(used);
+                spans.push(TSpan::styled(" ".repeat(pad), base));
+                lines.push(Line::from(spans));
+            }
+            crate::todo::Entry::Raw(text) => lines.push(Line::from(TSpan::styled(
+                text.clone(),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ))),
+        }
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(t.bg_dark)),
+        parts[2],
+    );
+    render_divider(f, parts[3], t);
+
+    let foot: Vec<(&str, &str)> = vec![
+        ("↵", "Add"),
+        ("Space", "Toggle"),
+        ("↑↓", "Move"),
+        ("⌘E", "Edit"),
+        ("⌘D", "Delete"),
+        ("⌘⇧D", "Clear"),
+        ("Esc", "Close"),
+    ];
+    f.render_widget(
+        Paragraph::new(hint_row(&foot, parts[4].width, t)).style(Style::default().bg(t.bg_dark)),
+        parts[4],
+    );
+}
+
+/// Clipboard history (⌥V) — this session's copies, newest first.
+fn render_clipboard(f: &mut Frame, area: Rect, app: &App, below: usize) {
+    let t = &app.theme;
+    let rect = dialog_rect_stacked(area, below, app.dialog_size_pct);
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.accent))
+        .title(TSpan::styled(
+            " Clipboard ",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(t.bg_dark));
+    let inner = pad_x(block.inner(rect), space::SM);
+    f.render_widget(block, rect);
+
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if app.clip_ring.is_empty() {
+        lines.push(Line::from(TSpan::styled(
+            "Nothing copied yet in this session.",
+            Style::default().fg(t.fg_dim),
+        )));
+    }
+    let list_h = parts[0].height as usize;
+    let start = app.clip_cursor.saturating_sub(list_h.saturating_sub(1));
+    for (row, entry) in app.clip_ring.iter().enumerate().skip(start).take(list_h) {
+        let on_cursor = row == app.clip_cursor;
+        let base = if on_cursor { t.selection(true) } else { Style::default().fg(t.fg) };
+        let mut spans =
+            vec![TSpan::styled(" ", base), TSpan::styled(entry.label.clone(), base)];
+        // Multi-line copies say so — the preview only shows the first line.
+        if entry.lines > 1 {
+            spans.push(TSpan::styled(
+                format!("  +{} lines", entry.lines - 1),
+                if on_cursor { base } else { Style::default().fg(t.fg_dim) },
+            ));
+        }
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        let pad = (parts[0].width as usize).saturating_sub(used);
+        spans.push(TSpan::styled(" ".repeat(pad), base));
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(t.bg_dark)),
+        parts[0],
+    );
+    render_divider(f, parts[1], t);
+
+    let foot: Vec<(&str, &str)> =
+        vec![("↵", "Paste"), ("↑↓", "Move"), ("⌘D", "Clear all"), ("Esc", "Close")];
+    f.render_widget(
+        Paragraph::new(hint_row(&foot, parts[2].width, t)).style(Style::default().bg(t.bg_dark)),
+        parts[2],
+    );
+}
+
 /// The Explorer file-operation prompt (new file / folder, rename, delete). A
 /// compact box near the top so the list it acts on stays visible underneath,
 /// rather than a full-screen overlay.
 fn render_prompt(f: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
-    // Height: borders + an input row (when typing) + a footer row.
+    // Height: borders + an input row (when typing) + a footer row. The prompt
+    // is an alert rather than a browsable dialog — a full-height box for
+    // "Delete file?" would bury the list it's asking about — but its width
+    // comes from the same helper so it lines up with everything else.
     let h = if app.prompt.needs_input() { 4 } else { 3 };
-    let w = (area.width as u32 * 7 / 10).clamp(44, 88).min(area.width as u32) as u16;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    // Sit a little below the top so it reads as floating above the content.
-    let y = area.y + (area.height / 6).min(area.height.saturating_sub(h));
-    let rect = Rect::new(x, y, w, h);
+    let rect = dialog_rect_content(area, 0, app.dialog_size_pct, h);
 
     f.render_widget(Clear, rect);
     let block = Block::default()
@@ -2407,6 +2612,7 @@ fn render_prompt(f: &mut Frame, area: Rect, app: &App) {
             Some(PromptKind::QuitTerminal) => {
                 vec![("Y", "close"), ("A", "close all"), ("Esc", "cancel")]
             }
+            Some(PromptKind::OpenUrl) => vec![("\u{21b5}", "open"), ("Esc", "cancel")],
             _ => vec![("Enter", "confirm"), ("Esc", "cancel")],
         };
         let foot_rect = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
@@ -3099,19 +3305,14 @@ fn render_file_dialog(f: &mut Frame, area: Rect, app: &mut App, below: usize) {
 /// folder is open the folder-requiring sections are dropped, so only shortcuts
 /// that actually work are shown.
 ///
-/// `gui` reflects `App::gui`: in TUI mode every Oxru shortcut here needs a 3rd
-/// key (see `input::shortcut_mods`), so most entries are built through
-/// [`cmd_str`]/[`ctrl_str`]/[`alt_str`] rather than hardcoded so the displayed
-/// combo always matches what actually fires. Two families are deliberately
-/// exempt and stay literal regardless of `gui`:
-/// - the embedded terminal's own key handling (word-jump, copy mode, shell
-///   pass-through — it mirrors a real terminal app, not an Oxru shortcut)
-/// - a handful of shortcuts that are *already* multi-modifier in GUI mode
-///   (add-caret's ⌘⌥↕, new-folder's ⇧⌥N) — Ctrl+Alt / Alt+Shift is already
-///   the TUI 3-key shape, so there's nothing left to add.
-fn shortcut_groups(has_folder: bool, gui: bool) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
-    let c = |k: &str| cmd_str(k, gui); // ⌘/Ctrl-fold shortcuts
-    let a = |k: &str| alt_str(k, gui); // Alt/Option-only shortcuts
+/// Entries are built through [`cmd_str`]/[`ctrl_str`]/[`alt_str`] rather than
+/// hardcoded, so the displayed combo is always the one that actually fires on
+/// this OS. The embedded terminal's own chords (word-jump, copy mode, shell
+/// pass-through) are written literally: they mirror a real terminal app rather
+/// than being Oxru shortcuts.
+fn shortcut_groups(has_folder: bool) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
+    let c = |k: &str| cmd_str(k); // ⌘/Ctrl-fold shortcuts
+    let a = |k: &str| alt_str(k); // Alt/Option-only shortcuts
 
     // Global section: hide Files / Terminal entries when there's no folder.
     let mut global: Vec<(String, &'static str)> =
@@ -3122,6 +3323,8 @@ fn shortcut_groups(has_folder: bool, gui: bool) -> Vec<(&'static str, Vec<(Strin
         global.push((a("T"), "Toggle terminal"));
     }
     global.push((a("Z"), "Toggle word wrap"));
+    global.push((a("D"), "To-do list"));
+    global.push((a("V"), "Clipboard history"));
     global.push((c(","), "Settings"));
     global.push((c("Q"), "Quit"));
     global.push(("F1".to_string(), "This shortcuts list"));
@@ -3130,7 +3333,7 @@ fn shortcut_groups(has_folder: bool, gui: bool) -> Vec<(&'static str, Vec<(Strin
 
     // The editor, file dialog, terminal and find bar all need an open folder.
     if has_folder {
-        groups.extend(folder_shortcut_groups(gui));
+        groups.extend(folder_shortcut_groups());
     }
     groups.push((
         "Settings",
@@ -3152,10 +3355,10 @@ fn shortcut_groups(has_folder: bool, gui: bool) -> Vec<(&'static str, Vec<(Strin
 }
 
 /// The shortcut sections that only make sense once a folder is open.
-fn folder_shortcut_groups(gui: bool) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
-    let c = |k: &str| cmd_str(k, gui);
-    let ct = |k: &str| ctrl_str(k, gui);
-    let a = |k: &str| alt_str(k, gui);
+fn folder_shortcut_groups() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
+    let c = |k: &str| cmd_str(k);
+    let ct = |k: &str| ctrl_str(k);
+    let a = |k: &str| alt_str(k);
     let pair = |a: String, b: String| format!("{a}  {b}");
 
     vec![
@@ -3188,10 +3391,9 @@ fn folder_shortcut_groups(gui: bool) -> Vec<(&'static str, Vec<(String, &'static
                 (pair(a("\u{232b}"), c("\u{232b}")), "Delete word \u{b7} to line start"),
                 ("Tab  \u{21e7}Tab".to_string(), "Indent \u{b7} outdent selection"),
                 (c("D"), "Add caret at next match (multi-cursor)"),
-                // Already ⌘⌥ (Ctrl+Alt) in GUI mode — already the TUI 3-key
-                // shape, so this doesn't change between modes.
+                // Already ⌘⌥ (Ctrl+Alt) — written literally.
                 (
-                    pair(cmd_str("\u{2325}\u{2191}", true), cmd_str("\u{2325}\u{2193}", true)),
+                    pair(cmd_str("\u{2325}\u{2191}"), cmd_str("\u{2325}\u{2193}")),
                     "Add caret above \u{b7} below",
                 ),
                 ("Esc".to_string(), "Collapse to one caret"),
@@ -3205,9 +3407,8 @@ fn folder_shortcut_groups(gui: bool) -> Vec<(&'static str, Vec<(String, &'static
                 ("\u{21b5}".to_string(), "Open file / fold folder"),
                 ("Tab  \u{21e7}Tab".to_string(), "Search into \u{b7} out of folder"),
                 (c("N"), "New file"),
-                // Already ⇧⌥ (Alt+Shift) in GUI mode — already the TUI 3-key
-                // shape, so this doesn't change between modes.
-                (alt_str("\u{21e7}N", true), "New folder"),
+                // Already ⇧⌥ (Alt+Shift) — written literally.
+                (alt_str("\u{21e7}N"), "New folder"),
                 (c("R"), "Rename"),
                 (c("D"), "Delete"),
                 (pair(c("\u{21e7}C"), c("\u{21e7}R")), "Copy path \u{b7} relative path"),
@@ -3229,39 +3430,39 @@ fn folder_shortcut_groups(gui: bool) -> Vec<(&'static str, Vec<(String, &'static
         ),
         (
             // The embedded terminal's own key handling is exempt from the TUI
-            // 3-key rule (see the doc comment above) — every entry below
-            // stays in its 2-key GUI style regardless of `gui`.
+            // own chords (see the doc comment above) — every entry below is
+            // written literally.
             "Terminal",
             vec![
                 (
-                    pair(ctrl_str("Tab", true), ctrl_str("\u{21e7}Tab", true)),
+                    pair(ctrl_str("Tab"), ctrl_str("\u{21e7}Tab")),
                     "Next \u{b7} previous terminal",
                 ),
-                (alt_str("N", true), "New terminal"),
-                (pair(alt_str("W", true), cmd_str("W", true)), "Close terminal"),
-                (alt_str("G", true), "Grid layout (click a tile to switch)"),
-                (cmd_str("K", true), "Quick-switch terminal (type to filter)"),
-                (cmd_str("1-9", true), "Jump to terminal N"),
-                (ctrl_str("\u{21e7}\u{2190} / \u{2192}", true), "Move terminal left \u{b7} right"),
+                (alt_str("N"), "New terminal"),
+                (alt_str("W"), "Close terminal"),
+                (alt_str("G"), "Grid layout (click a tile to switch)"),
+                (alt_str("K"), "Quick-switch terminal (type to filter)"),
+                (alt_str("1-9"), "Jump to terminal N"),
+                (ctrl_str("\u{21e7}\u{2190} / \u{2192}"), "Move terminal left \u{b7} right"),
                 (
-                    pair(alt_str("\u{2190}\u{2192}", true), ctrl_str("\u{2190}\u{2192}", true)),
+                    pair(alt_str("\u{2190}\u{2192}"), ctrl_str("\u{2190}\u{2192}")),
                     "Shell cursor by word",
                 ),
-                (pair(cmd_str("\u{2190}", true), cmd_str("\u{2192}", true)), "Cursor to line start \u{b7} end"),
+                (pair(cmd_str("\u{2190}"), cmd_str("\u{2192}")), "Cursor to line start \u{b7} end"),
                 (
-                    pair(alt_str("\u{232b}", true), cmd_str("\u{232b}", true)),
+                    pair(alt_str("\u{232b}"), cmd_str("\u{232b}")),
                     "Delete word \u{b7} to line start",
                 ),
                 (
-                    pair(alt_str("\u{2191}", true), alt_str("\u{2193}", true)),
+                    pair(alt_str("\u{2191}"), alt_str("\u{2193}")),
                     "Copy mode (free cursor + select)",
                 ),
-                (pair(cmd_str("C", true), cmd_str("V", true)), "Copy selection \u{b7} paste"),
+                (pair(cmd_str("C"), cmd_str("V")), "Copy selection \u{b7} paste"),
                 ("\u{21e7}PgUp/Dn  fn\u{2191}/\u{2193}".to_string(), "Scroll history"),
                 ("\u{21e7}\u{2190} \u{2191} \u{2192} \u{2193}".to_string(), "Mark text (\u{21e7}\u{2325} by word)"),
                 ("Drag \u{b7} \u{21e7}Click".to_string(), "Select w/ mouse (\u{21e7}Click extends)"),
                 (
-                    pair(alt_str("\u{21b5}", true), "\u{21e7}\u{21b5}".to_string()),
+                    pair(alt_str("\u{21b5}"), "\u{21e7}\u{21b5}".to_string()),
                     "Soft newline (don't submit)",
                 ),
             ],
@@ -3273,9 +3474,26 @@ fn folder_shortcut_groups(gui: bool) -> Vec<(&'static str, Vec<(String, &'static
             vec![
                 ("\u{2190}\u{2191}\u{2193}\u{2192} / hjkl".to_string(), "Move cursor"),
                 ("\u{21e7} + arrows".to_string(), "Mark / extend selection"),
-                (pair(alt_str("\u{2190}", true), alt_str("\u{2192}", true)), "Move by word"),
-                (format!("\u{21b5} / y / {}", cmd_str("C", true)), "Copy & exit"),
+                (pair(alt_str("\u{2190}"), alt_str("\u{2192}")), "Move by word"),
+                (format!("\u{21b5} / y / {}", cmd_str("C")), "Copy & exit"),
                 ("Esc / q".to_string(), "Exit copy mode"),
+            ],
+        ),
+        (
+            "To-do list",
+            vec![
+                ("\u{21b5}".to_string(), "Add the typed task"),
+                ("Space".to_string(), "Toggle the highlighted task"),
+                (c("E"), "Edit the raw markdown file in a tab"),
+                (c("D"), "Delete the highlighted task"),
+                (c("\u{21e7}D"), "Clear every completed task"),
+            ],
+        ),
+        (
+            "Clipboard history",
+            vec![
+                ("\u{21b5}".to_string(), "Paste where you were"),
+                (c("D"), "Clear the history"),
             ],
         ),
         (
@@ -3295,7 +3513,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App, below: usize) {
     let t = app.theme.clone();
     // Align the description column to the widest key combo (clamped) so every row
     // is spaced out evenly across the panel.
-    let groups = shortcut_groups(app.has_folder(), app.gui);
+    let groups = shortcut_groups(app.has_folder());
     let key_col = groups
         .iter()
         .flat_map(|(_, items)| items.iter())
@@ -3331,7 +3549,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &mut App, below: usize) {
 
     f.render_widget(
         Paragraph::new(Line::from(TSpan::styled(
-            "\u{2318} (Command) works anywhere Ctrl does.",
+            "\u{2318} (Command) works anywhere Ctrl does \u{b7} same keys in the terminal and the window.",
             Style::default().fg(t.fg_dim),
         )))
         .style(Style::default().bg(t.bg_dark)),
@@ -3610,6 +3828,109 @@ mod tests {
         panic!("no row containing {needle:?}");
     }
 
+    /// Measure the dialog frame actually drawn on screen: `(width, height)` of
+    /// the rounded border box.
+    fn dialog_frame(app: &mut App) -> (usize, usize) {
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut left = usize::MAX;
+        let mut right = 0usize;
+        let mut top = usize::MAX;
+        let mut bottom = 0usize;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if matches!(buf[(x, y)].symbol(), "╭" | "╮" | "╰" | "╯") {
+                    left = left.min(x as usize);
+                    right = right.max(x as usize);
+                    top = top.min(y as usize);
+                    bottom = bottom.max(y as usize);
+                }
+            }
+        }
+        if left == usize::MAX {
+            return (0, 0);
+        }
+        (right - left + 1, bottom - top + 1)
+    }
+
+    /// Every browsable dialog is the size Settings says, in *both* dimensions,
+    /// and they're all the same size as each other.
+    ///
+    /// The bug this pins: the clipboard palette and the terminal quick-switch
+    /// sized their height to their content, so at 99% they drew a short box at
+    /// the top of the window while every dialog beside them filled the screen.
+    /// An earlier version of this test only compared widths, which is exactly
+    /// why the height drift survived it.
+    #[test]
+    fn every_dialog_is_the_configured_size_in_both_dimensions() {
+        use crate::app::Dialog;
+        let dir = workspace();
+        let all = [
+            Dialog::Files,
+            Dialog::Recent,
+            Dialog::Settings,
+            Dialog::Help,
+            Dialog::SearchFiles,
+            Dialog::Todos,
+            Dialog::Clipboard,
+            Dialog::TerminalPicker,
+        ];
+
+        let mut expected: Option<(usize, usize)> = None;
+        for d in all {
+            let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+            app.dialog_size_pct = 99;
+            app.open_dialog(d);
+            let got = dialog_frame(&mut app);
+            assert!(got.0 > 0 && got.1 > 0, "{d:?}: no dialog frame drawn");
+            match expected {
+                None => expected = Some(got),
+                Some(want) => assert_eq!(
+                    got, want,
+                    "{d:?} is {got:?} but the others are {want:?} — every dialog \
+                     must be the one configured size"
+                ),
+            }
+        }
+
+        // …and the size actually tracks the setting, both ways.
+        for d in all {
+            let mut small = App::new(Some(dir.path().to_path_buf())).unwrap();
+            let mut big = App::new(Some(dir.path().to_path_buf())).unwrap();
+            small.dialog_size_pct = 50;
+            big.dialog_size_pct = 99;
+            small.open_dialog(d);
+            big.open_dialog(d);
+            let (sw, sh) = dialog_frame(&mut small);
+            let (bw, bh) = dialog_frame(&mut big);
+            assert!(bw > sw, "{d:?}: width ignores the setting ({sw} -> {bw})");
+            assert!(bh > sh, "{d:?}: height ignores the setting ({sh} -> {bh})");
+        }
+    }
+
+    /// The terminal body is painted on `terminal_bg`, whatever that's set to —
+    /// so a config that lifts it actually takes effect.
+    #[test]
+    fn the_terminal_body_is_painted_on_the_terminal_surface() {
+        let dir = workspace();
+        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+        app.open_path(&dir.path().join("src/main.rs"));
+        app.toggle_terminal_modal();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let on_terminal_surface = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].bg == app.theme.terminal_bg)
+            .count();
+        assert!(
+            on_terminal_surface > 100,
+            "the terminal body should be drawn on `terminal_bg`, found {on_terminal_surface} cells"
+        );
+    }
+
     #[test]
     fn current_line_is_tinted_across_the_full_pane_width() {
         let dir = workspace();
@@ -3834,33 +4155,29 @@ mod tests {
     /// terminal already reserves, so Oxru requires ⌘⌥S there instead; GUI
     /// mode keeps the plain 2-key ⌘S. Showing the wrong one is worse than
     /// showing nothing, since it sends the user to a combo that won't fire.
+    /// One keymap: the footer prints the same combo whichever backend is
+    /// drawing it. It used to show `⌘⌥S` in the terminal and `⌘S` in the
+    /// window for the same action.
     #[test]
-    fn editor_footer_shows_the_three_key_combo_in_tui_mode() {
-        let dir = workspace();
-        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
-        assert!(!app.gui, "defaults to TUI mode");
-        app.open_path(&dir.path().join("src/main.rs"));
-        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
-        terminal.draw(|f| render(f, &mut app)).unwrap();
-        let text = screen_text(&terminal);
-        assert!(text.contains("\u{2318}\u{2325}S"), "Save shows as \u{2318}\u{2325}S in TUI mode");
-        assert!(!text.contains("\u{2318}S "), "the bare 2-key \u{2318}S must not appear");
+    fn the_footer_shows_the_same_combo_in_both_modes() {
+        for gui in [false, true] {
+            let dir = workspace();
+            let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
+            app.gui = gui;
+            app.open_path(&dir.path().join("src/main.rs"));
+            let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+            terminal.draw(|f| render(f, &mut app)).unwrap();
+            let text = screen_text(&terminal);
+            assert!(text.contains("\u{2318}S "), "Save shows as the plain \u{2318}S (gui = {gui})");
+            assert!(
+                !text.contains("\u{2318}\u{2325}S"),
+                "the old 3-key \u{2318}\u{2325}S must be gone (gui = {gui})"
+            );
+        }
     }
 
     #[test]
-    fn editor_footer_shows_the_plain_two_key_combo_in_gui_mode() {
-        let dir = workspace();
-        let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
-        app.gui = true;
-        app.open_path(&dir.path().join("src/main.rs"));
-        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
-        terminal.draw(|f| render(f, &mut app)).unwrap();
-        let text = screen_text(&terminal);
-        assert!(text.contains("\u{2318}S "), "Save shows as the plain \u{2318}S in GUI mode");
-    }
-
-    #[test]
-    fn help_overlay_shows_the_three_key_combo_in_tui_mode() {
+    fn help_overlay_shows_the_plain_combo_in_terminal_mode() {
         let dir = workspace();
         let mut app = App::new(Some(dir.path().to_path_buf())).unwrap();
         assert!(!app.gui, "defaults to TUI mode");
@@ -3872,14 +4189,22 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 44)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let text = screen_text(&terminal);
-        assert!(text.contains("\u{2318}\u{2325}S"), "Save shows as \u{2318}\u{2325}S in TUI mode");
+        assert!(text.contains("\u{2318}S"), "Save shows as the plain \u{2318}S in the terminal too");
 
-        // The embedded terminal's own shortcuts stay 2-key even in TUI mode —
-        // they mirror a real terminal app, not an Oxru shortcut.
-        app.help_scroll(500);
-        terminal.draw(|f| render(f, &mut app)).unwrap();
-        let text = screen_text(&terminal);
-        assert!(text.contains("\u{2325}N"), "terminal's New stays the plain \u{2325}N even in TUI mode");
+        // The embedded terminal's own shortcuts are written literally — they
+        // mirror a real terminal app, not an Oxru shortcut. Asserted against
+        // the sheet's *data* rather than a scrolled screenshot: which page a
+        // given row lands on changes every time a group is added, and that has
+        // nothing to do with what this test is checking.
+        let groups = shortcut_groups(true);
+        let terminal_group = groups
+            .iter()
+            .find(|(name, _)| *name == "Terminal")
+            .expect("the sheet has a Terminal group");
+        assert!(
+            terminal_group.1.iter().any(|(chord, label)| chord == "\u{2325}N" && *label == "New terminal"),
+            "terminal's New stays the plain \u{2325}N"
+        );
     }
 
     #[test]

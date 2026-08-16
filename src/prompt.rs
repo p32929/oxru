@@ -23,6 +23,10 @@ pub enum PromptKind {
     /// "This file changed on disk while you had unsaved edits" — reload (discard
     /// my edits) or keep mine. Only raised when there's a genuine conflict.
     ExternalChange,
+    /// "Open this link in your browser?" — raised by clicking a URL in a
+    /// terminal. Always confirmed, never automatic: the text came from whatever
+    /// happened to be printed, which isn't something to trust with a click.
+    OpenUrl,
 }
 
 #[derive(Debug, Default)]
@@ -114,6 +118,7 @@ impl Prompt {
                 format!("\"{}\" has unsaved changes", self.target_name())
             }
             Some(PromptKind::QuitUnsaved) | Some(PromptKind::QuitTerminal) => self.message.clone(),
+            Some(PromptKind::OpenUrl) => self.message.clone(),
             Some(PromptKind::ExternalChange) => {
                 format!(
                     "\"{}\" changed on disk — you have unsaved edits.  R = reload (lose edits) · K = keep mine",

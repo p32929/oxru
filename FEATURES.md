@@ -2,7 +2,7 @@
 
 A living map of what Oxru does and how each feature is verified. The goal is that
 **every feature works identically with keyboard and mouse, in both GUI mode
-(`--gui`, a real window) and TUI mode (inside another terminal).**
+(a real window, the default) and TUI mode (`--term`, inside another terminal).**
 
 - ✅ **Automated** — covered by a unit/integration test (named below).
 - 🟡 **Indirect** — exercised by a test, but not asserted on its own.
@@ -63,6 +63,30 @@ Detection is a throttled `stat` (mtime + length) on open files, run from both
 loops via `App::poll_file_changes` and also forced on GUI window-focus. No file
 watcher / dependency — adequate because the common trigger is a command in
 oxru's own terminal (which keeps the loop ticking).
+
+## To-do list (⌥D) & clipboard history (⌥V)
+
+The to-do list is a view over `~/.config/oxru/todos.md`; ⌃E opens that file as
+an ordinary tab, so raw-text editing is the real editor rather than a second,
+weaker one. Clipboard history is in-memory only and never touches disk.
+
+| Feature | Status | Test |
+|---|---|---|
+| Parse every checkbox spelling (`- [x]`, `* [X]`, `[x]`, `[]`) | ✅ | `parses_every_checkbox_spelling` |
+| Bare lines / `-` / `1.` become unchecked tasks | ✅ | `bare_lines_and_list_markers_become_unchecked_tasks` |
+| Headings + blank lines round-trip untouched | ✅ | `headings_and_blank_lines_survive_untouched` |
+| Writing normalises tasks, keeps order, is idempotent | ✅ | `writing_normalises_tasks_but_keeps_order`, `parse_write_round_trips` |
+| `[TODO]` is prose, not a checkbox | ✅ | `a_bracketed_word_is_prose_not_a_checkbox` |
+| Add / toggle / remove / clear-completed | ✅ | `add_toggle_remove_and_clear` |
+| Every change written straight to the file | ✅ | `todo_add_toggle_and_clear_write_through_to_the_file` |
+| Cursor only ever lands on a task | ✅ | `navigation_only_lands_on_tasks`, `todo_cursor_stays_on_a_task_after_deleting_the_last_one` |
+| Load/save round-trip on disk | ✅ | `load_save_round_trip_on_disk` |
+| Edit the raw file as a tab (⌃E) | ⚙️ | opens `todos_path()` via `open_path` |
+| Every copy feeds the history, newest first | ✅ | `copying_feeds_the_clipboard_history_newest_first` |
+| A repeat copy moves up instead of duplicating | ✅ | `copying_the_same_text_twice_moves_it_up_rather_than_duplicating` |
+| History capped, blank copies skipped | ✅ | `the_clipboard_history_is_capped_and_skips_blank_copies` |
+| Paste inserts and re-arms the system clipboard | ✅ | `pasting_from_history_inserts_into_the_editor_and_sets_the_clipboard` |
+| Clear the history | ✅ | `clearing_the_clipboard_history_empties_it` |
 
 ## Tabs
 
