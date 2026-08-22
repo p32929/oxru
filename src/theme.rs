@@ -1,0 +1,623 @@
+//! Colour theme. A small, named palette drives every styled element in the UI
+//! (chrome and syntax alike), so the whole look can be re-skinned from one place
+//! — and overridden from the user's config file.
+//!
+//! The default is the **VSCode "Default Dark" (Dark+)** palette — the same
+//! workbench and token colours VSCode ships with — chosen so contrast is good
+//! and text stays readable out of the box. Each field is a `ratatui` [`Color`];
+//! the config layer can replace any of them with a `#rrggbb` hex string (see
+//! [`Theme::apply_overrides`]).
+
+use std::collections::HashMap;
+
+use ratatui::style::{Color, Modifier, Style};
+
+/// Popular accent colours offered in the Settings dialog. Green is the default;
+/// the rest are Material-ish 500-weight hues.
+pub const ACCENT_PALETTE: &[(&str, (u8, u8, u8))] = &[
+    ("Green", (0x4c, 0xaf, 0x50)),
+    ("Blue", (0x4f, 0xc1, 0xff)),
+    ("Red", (0xe5, 0x39, 0x35)),
+    ("Purple", (0xab, 0x47, 0xbc)),
+    ("Orange", (0xff, 0x98, 0x00)),
+    ("Teal", (0x26, 0xa6, 0x9a)),
+    ("Indigo", (0x5c, 0x6b, 0xc0)),
+    ("Pink", (0xec, 0x40, 0x7a)),
+    ("White", (0xe0, 0xe0, 0xe0)),
+];
+
+/// The 16 ANSI colours a program can ask for, in the standard order:
+/// black, red, green, yellow, blue, magenta, cyan, white, then the eight
+/// bright variants.
+///
+/// Oxru has to supply these itself. The rendering backend resolves
+/// `Color::Indexed(i)` through a *hardcoded* table — the original xterm one,
+/// where red is `#800000` and blue is `#000080` — and no builder option
+/// overrides it. Those values were chosen for CRTs; on a dark background they
+/// are barely legible, which is why terminal output looked so much worse here
+/// than in VSCode, whose terminal ships a modern palette. This is that palette
+/// (VSCode's Dark+ terminal colours), applied in both the window and the
+/// terminal so output reads the same wherever Oxru is running.
+pub const ANSI_PALETTE: [Color; 16] = [
+    Color::Rgb(0x00, 0x00, 0x00), // black
+    Color::Rgb(0xcd, 0x31, 0x31), // red
+    Color::Rgb(0x0d, 0xbc, 0x79), // green
+    Color::Rgb(0xe5, 0xe5, 0x10), // yellow
+    Color::Rgb(0x24, 0x72, 0xc8), // blue
+    Color::Rgb(0xbc, 0x3f, 0xbc), // magenta
+    Color::Rgb(0x11, 0xa8, 0xcd), // cyan
+    Color::Rgb(0xe5, 0xe5, 0xe5), // white
+    Color::Rgb(0x66, 0x66, 0x66), // bright black
+    Color::Rgb(0xf1, 0x4c, 0x4c), // bright red
+    Color::Rgb(0x23, 0xd1, 0x8b), // bright green
+    Color::Rgb(0xf5, 0xf5, 0x43), // bright yellow
+    Color::Rgb(0x3b, 0x8e, 0xea), // bright blue
+    Color::Rgb(0xd6, 0x70, 0xd6), // bright magenta
+    Color::Rgb(0x29, 0xb8, 0xdb), // bright cyan
+    Color::Rgb(0xe5, 0xe5, 0xe5), // bright white
+];
+
+/// **The** list of `[theme]` config keys: the name a config file writes, and
+/// how to reach the field it sets. Parsing walks this, so a colour can't be
+/// settable without being named here, or named without being settable.
+///
+/// The 16 ANSI entries are in the same table rather than a list of their own —
+/// they're config keys like any other, and keeping them separate is what let
+/// the palette and its key list be edited independently.
+pub const THEME_KEYS: &[(&str, fn(&mut Theme) -> &mut Color)] = &[
+    ("bg", |t| &mut t.bg),
+    ("bg_dark", |t| &mut t.bg_dark),
+    ("bg_light", |t| &mut t.bg_light),
+    ("border", |t| &mut t.border),
+    ("line_hl", |t| &mut t.line_hl),
+    ("indent_guide", |t| &mut t.indent_guide),
+    ("terminal_bg", |t| &mut t.terminal_bg),
+    ("fg", |t| &mut t.fg),
+    ("fg_dim", |t| &mut t.fg_dim),
+    ("accent", |t| &mut t.accent),
+    ("accent_fg", |t| &mut t.accent_fg),
+    ("status_bg", |t| &mut t.status_bg),
+    ("sel_bg", |t| &mut t.sel_bg),
+    ("find_match", |t| &mut t.find_match),
+    ("find_current", |t| &mut t.find_current),
+    ("red", |t| &mut t.red),
+    ("green", |t| &mut t.green),
+    ("yellow", |t| &mut t.yellow),
+    ("orange", |t| &mut t.orange),
+    ("blue", |t| &mut t.blue),
+    ("purple", |t| &mut t.purple),
+    ("cyan", |t| &mut t.cyan),
+    ("comment", |t| &mut t.comment),
+    ("ansi_black", |t| &mut t.ansi[0]),
+    ("ansi_red", |t| &mut t.ansi[1]),
+    ("ansi_green", |t| &mut t.ansi[2]),
+    ("ansi_yellow", |t| &mut t.ansi[3]),
+    ("ansi_blue", |t| &mut t.ansi[4]),
+    ("ansi_magenta", |t| &mut t.ansi[5]),
+    ("ansi_cyan", |t| &mut t.ansi[6]),
+    ("ansi_white", |t| &mut t.ansi[7]),
+    ("ansi_bright_black", |t| &mut t.ansi[8]),
+    ("ansi_bright_red", |t| &mut t.ansi[9]),
+    ("ansi_bright_green", |t| &mut t.ansi[10]),
+    ("ansi_bright_yellow", |t| &mut t.ansi[11]),
+    ("ansi_bright_blue", |t| &mut t.ansi[12]),
+    ("ansi_bright_magenta", |t| &mut t.ansi[13]),
+    ("ansi_bright_cyan", |t| &mut t.ansi[14]),
+    ("ansi_bright_white", |t| &mut t.ansi[15]),
+];
+
+
+/// Darken an accent channel to make a harmonious selection background.
+fn dim_channel(c: u8) -> u8 {
+    (c as f32 * 0.38) as u8
+}
+
+/// The RGB components of a `Color`, if it is an explicit `Rgb` (the only kind the
+/// theme uses); named/indexed colours have no components to blend.
+fn rgb_of(c: Color) -> Option<(u8, u8, u8)> {
+    match c {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
+    }
+}
+
+/// Linear blend from `a` to `b` by `t` in `[0, 1]`.
+fn lerp(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 * (1.0 - t) + b as f32 * t).round() as u8
+}
+
+/// How far the status bar sits from the accent toward the background. A bar at
+/// full accent strength is a solid band of saturated colour across the bottom of
+/// the window — far too loud to sit under code all day — while anything much
+/// darker stops reading as a bar at all.
+const STATUS_BAR_MIX: f32 = 0.62;
+
+/// The status bar's background for a given palette: a darkened shade of that
+/// palette's own accent.
+///
+/// The default palette derives it this way, and so do [`Theme::set_accent`] and
+/// an `accent` config override, so the bar always belongs to whatever colours
+/// are currently on screen. Borrowing a fixed colour from somewhere else (this
+/// used to be VSCode's `#007acc`) puts an unrelated hue against the accent in
+/// the one place they're guaranteed to be seen together, and it goes wrong the
+/// moment the accent isn't blue.
+fn status_bar_bg(accent: Color, bg: Color) -> Color {
+    mix(accent, bg, STATUS_BAR_MIX)
+}
+
+/// Mix `a` toward `b` by `t` in `[0, 1]`. Non-RGB colours (never used by the
+/// theme) pass through unchanged rather than guessing components for them.
+pub fn mix(a: Color, b: Color, t: f32) -> Color {
+    match (rgb_of(a), rgb_of(b)) {
+        (Some((ar, ag, ab)), Some((br, bg, bb))) => {
+            Color::Rgb(lerp(ar, br, t), lerp(ag, bg, t), lerp(ab, bb, t))
+        }
+        _ => a,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Theme {
+    /// Editor background (`editor.background`).
+    pub bg: Color,
+    /// Sidebar / panel / palette background (`sideBar.background`).
+    pub bg_dark: Color,
+    /// Subtle fill: inactive selection, scrollbar thumb, the `~` past EOF.
+    pub bg_light: Color,
+    /// Hairline colour for borders and separators between surfaces. A cell grid
+    /// can't draw a 1px rule the way a GUI can, so the whole layout leans on
+    /// tonal separation instead — this is the one slot dedicated to it, kept a
+    /// step brighter than `bg_light` so a border reads as an edge rather than
+    /// as a fill.
+    pub border: Color,
+    /// Background tint for the row the caret is on (`editor.lineHighlight`).
+    /// Roughly 12-20 points above `bg` per channel — enough to locate the caret
+    /// with a glance and no more. The first attempt at ~10 points was invisible
+    /// in practice, the same way the original `bg`/`bg_dark` pair was: a tint
+    /// nobody can see is just a slower way of having no tint.
+    pub line_hl: Color,
+    /// The vertical rule drawn at each indent level (`editorIndentGuide`).
+    pub indent_guide: Color,
+    /// The 16 ANSI colours terminal output asks for — see [`ANSI_PALETTE`].
+    pub ansi: [Color; 16],
+    /// Surface behind an embedded terminal, for cells the program hasn't
+    /// coloured itself.
+    ///
+    /// Matches `bg` by default. It was briefly lifted a few steps to rescue
+    /// unreadable output, but that was treating the symptom: the real cause was
+    /// the ANSI palette (see [`ANSI_PALETTE`]), and a lighter surface actually
+    /// costs contrast — every coloured foreground measures ~13% worse against
+    /// `#26262b` than against `#1a1a1c`. Kept as its own slot so a terminal
+    /// *can* be set apart deliberately, at a known cost.
+    pub terminal_bg: Color,
+    /// Primary foreground text (`editor.foreground`).
+    pub fg: Color,
+    /// Dimmed text: line numbers, inactive labels.
+    pub fg_dim: Color,
+    /// Bright accent for thin elements — focus, hint keys, active markers,
+    /// the current line number, palette border. Readable *as text* on a dark bg.
+    pub accent: Color,
+    /// Readable foreground on top of a filled accent (white).
+    pub accent_fg: Color,
+    /// Status-bar background — a darkened shade of this palette's own `accent`,
+    /// see [`status_bar_bg`].
+    pub status_bg: Color,
+    /// Focused-selection background (`list.activeSelectionBackground`).
+    pub sel_bg: Color,
+    /// Background for every in-file find match (`editor.findMatchHighlight`).
+    pub find_match: Color,
+    /// Background for the *current* find match (`editor.findMatchBackground`).
+    pub find_current: Color,
+
+    // Token palette (VSCode Dark+ TextMate colours), reused by syntax + chrome.
+    pub red: Color,
+    pub green: Color,
+    pub yellow: Color,
+    pub orange: Color,
+    pub blue: Color,
+    pub purple: Color,
+    pub cyan: Color,
+    pub comment: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        dark_plus()
+    }
+}
+
+/// VSCode "Default Dark+", with the surface ramp opened up.
+///
+/// VSCode's own workbench greys sit within ~7/255 of each other (`#1e1e1e` /
+/// `#252526`), which works there because every panel is separated by a real
+/// 1-pixel border. A character grid has no sub-cell rules to draw, so those
+/// same values made the editor, the tab strip and the footer read as one flat
+/// sheet — the active tab in particular was indistinguishable until it was
+/// given an accent-tinted background as a workaround. The ramp below keeps the
+/// Dark+ *hue* (a hair cooler) while spacing the steps far enough apart that
+/// each surface is legible as its own plane.
+fn dark_plus() -> Theme {
+    let bg = Color::Rgb(0x1a, 0x1a, 0x1c);
+    let accent = Color::Rgb(0x4c, 0xaf, 0x50);
+    Theme {
+        bg,
+        bg_dark: Color::Rgb(0x23, 0x23, 0x27),
+        bg_light: Color::Rgb(0x33, 0x33, 0x3a),
+        border: Color::Rgb(0x3d, 0x3d, 0x46),
+        line_hl: Color::Rgb(0x28, 0x28, 0x30),
+        indent_guide: Color::Rgb(0x33, 0x33, 0x3a),
+        terminal_bg: Color::Rgb(0x1a, 0x1a, 0x1c),
+        ansi: ANSI_PALETTE,
+        fg: Color::Rgb(0xd4, 0xd4, 0xd4),
+        fg_dim: Color::Rgb(0x85, 0x85, 0x85),
+        accent,
+        accent_fg: Color::Rgb(0xff, 0xff, 0xff),
+        status_bg: status_bar_bg(accent, bg),
+        sel_bg: Color::Rgb(0x1c, 0x42, 0x1e),
+        // Amber highlights for find, distinct from the green selection.
+        find_match: Color::Rgb(0x4d, 0x3c, 0x14),
+        find_current: Color::Rgb(0x8a, 0x60, 0x18),
+        red: Color::Rgb(0xf4, 0x47, 0x47),
+        green: Color::Rgb(0x6a, 0x99, 0x55),
+        yellow: Color::Rgb(0xdc, 0xdc, 0xaa),
+        orange: Color::Rgb(0xce, 0x91, 0x78),
+        blue: Color::Rgb(0x56, 0x9c, 0xd6),
+        purple: Color::Rgb(0xc5, 0x86, 0xc0),
+        cyan: Color::Rgb(0x4e, 0xc9, 0xb0),
+        comment: Color::Rgb(0x6a, 0x99, 0x55),
+    }
+}
+
+impl Theme {
+    /// A copy with every colour blended toward the background, for drawing a
+    /// dialog that sits *below* the focused one in the stack. `level` is how many
+    /// dialogs are above it (1 = just beneath the top); deeper = fainter. The
+    /// background itself is left untouched so the faded dialog melts into it.
+    pub fn dimmed(&self, level: u32) -> Theme {
+        // Fraction moved toward the background; ~55% per level, capped so even
+        // deep layers keep a faint outline.
+        let amount = (0.55 * level as f32).min(0.85);
+        let (br, bgc, bb) = rgb_of(self.bg).unwrap_or((0x1e, 0x1e, 0x1e));
+        let blend = |c: Color| match rgb_of(c) {
+            Some((r, g, b)) => Color::Rgb(
+                lerp(r, br, amount),
+                lerp(g, bgc, amount),
+                lerp(b, bb, amount),
+            ),
+            None => c,
+        };
+        let mut t = self.clone();
+        // Everything except `bg` (the canvas) fades toward the background.
+        t.bg_dark = blend(t.bg_dark);
+        t.bg_light = blend(t.bg_light);
+        t.border = blend(t.border);
+        t.line_hl = blend(t.line_hl);
+        t.indent_guide = blend(t.indent_guide);
+        t.terminal_bg = blend(t.terminal_bg);
+        for c in &mut t.ansi {
+            *c = blend(*c);
+        }
+        t.fg = blend(t.fg);
+        t.fg_dim = blend(t.fg_dim);
+        t.accent = blend(t.accent);
+        t.accent_fg = blend(t.accent_fg);
+        t.status_bg = blend(t.status_bg);
+        t.sel_bg = blend(t.sel_bg);
+        t.find_match = blend(t.find_match);
+        t.find_current = blend(t.find_current);
+        t.red = blend(t.red);
+        t.green = blend(t.green);
+        t.yellow = blend(t.yellow);
+        t.orange = blend(t.orange);
+        t.blue = blend(t.blue);
+        t.purple = blend(t.purple);
+        t.cyan = blend(t.cyan);
+        t.comment = blend(t.comment);
+        t
+    }
+
+    /// Apply `#rrggbb` overrides from a `[theme]` config table. Unknown keys and
+    /// malformed colours are ignored so a typo never breaks startup.
+    pub fn apply_overrides(&mut self, overrides: &HashMap<String, String>) {
+        // One pass over the key table: every colour a config file can name is
+        // named exactly once, in `THEME_KEYS`. This used to be a 23-arm match
+        // plus a separate loop over a separate list of the 16 ANSI keys, so a
+        // new colour meant remembering both.
+        for (key, setter) in THEME_KEYS {
+            if let Some(color) = overrides.get(*key).and_then(|v| parse_hex(v)) {
+                *setter(self) = color;
+            }
+        }
+        // Everything derived from the accent has to be re-derived when the
+        // accent itself is overridden, or the config silently produces a
+        // half-and-half theme: an `accent` override used to leave `status_bg`
+        // on the default palette's accent, so picking blue gave a blue UI with
+        // a green status bar. Each one is skipped if the user pinned it
+        // explicitly — an explicit value always beats a derived one.
+        if overrides.contains_key("accent") {
+            if !overrides.contains_key("sel_bg") {
+                if let Color::Rgb(r, g, b) = self.accent {
+                    self.sel_bg = Color::Rgb(dim_channel(r), dim_channel(g), dim_channel(b));
+                }
+            }
+            if !overrides.contains_key("status_bg") {
+                self.status_bg = status_bar_bg(self.accent, self.bg);
+            }
+        }
+    }
+
+    /// Style for a tree-sitter capture name, using VSCode Dark+ token colours.
+    pub fn syntax_style(&self, capture: &str) -> Style {
+        // A couple of token colours don't have a named palette slot.
+        const NUMBER: Color = Color::Rgb(0xb5, 0xce, 0xa8); // constants / numbers
+        const VARIABLE: Color = Color::Rgb(0x9c, 0xdc, 0xfe); // params / properties
+
+        let base = Style::default();
+        match capture {
+            "comment" => base.fg(self.comment).add_modifier(Modifier::ITALIC),
+            "keyword" => base.fg(self.blue),
+            "string" => base.fg(self.orange),
+            "type" | "type.builtin" => base.fg(self.cyan),
+            "function" | "function.method" | "function.macro" => base.fg(self.yellow),
+            "attribute" => base.fg(self.yellow),
+            "constant" | "constant.builtin" => base.fg(NUMBER),
+            "variable.builtin" => base.fg(self.blue),
+            "variable.parameter" | "property" => base.fg(VARIABLE),
+            // Plain variables, operators and punctuation stay default fg, matching
+            // VSCode (it doesn't tint these in the default TextMate theme).
+            _ => base.fg(self.fg),
+        }
+    }
+
+    /// Re-skin the UI around a new accent colour: the accent itself drives
+    /// borders/highlights/markers, and the focused-selection background becomes
+    /// a darkened shade of it so the two stay in harmony.
+    pub fn set_accent(&mut self, rgb: (u8, u8, u8)) {
+        let (r, g, b) = rgb;
+        self.accent = Color::Rgb(r, g, b);
+        self.sel_bg = Color::Rgb(dim_channel(r), dim_channel(g), dim_channel(b));
+        // Re-derived through the same rule the default palette uses, so the
+        // bar can never be left on a hue the accent no longer matches.
+        self.status_bg = status_bar_bg(self.accent, self.bg);
+    }
+
+    /// Foreground pair for text drawn on the status bar: a primary that reads
+    /// clearly on `status_bg`, and a muted one for secondary fields. Both are
+    /// derived from the bar's own background so they stay legible whatever the
+    /// accent sets it to.
+    pub fn status_fg(&self) -> (Color, Color) {
+        let primary = self.fg;
+        (primary, mix(primary, self.status_bg, 0.42))
+    }
+
+    /// The current accent as an RGB triple (for persisting to config).
+    pub fn accent_rgb(&self) -> (u8, u8, u8) {
+        match self.accent {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => (0x4c, 0xaf, 0x50),
+        }
+    }
+
+    /// Index of the palette entry matching the current accent, if any.
+    pub fn accent_index(&self) -> Option<usize> {
+        if let Color::Rgb(r, g, b) = self.accent {
+            ACCENT_PALETTE.iter().position(|(_, c)| *c == (r, g, b))
+        } else {
+            None
+        }
+    }
+
+    /// The standard "selected row" highlight: VSCode's blue when the owning pane
+    /// has focus, a muted grey otherwise — both with readable foregrounds.
+    pub fn selection(&self, focused: bool) -> Style {
+        if focused {
+            Style::default().bg(self.sel_bg).fg(self.accent_fg)
+        } else {
+            Style::default().bg(self.bg_light).fg(self.fg)
+        }
+    }
+}
+
+/// Parse `#rrggbb` (with or without the leading `#`) into an RGB colour.
+fn parse_hex(s: &str) -> Option<Color> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Relative luminance contrast, the WCAG formula. Used to assert the ANSI
+    /// palette is actually legible rather than eyeballing hex values.
+    fn contrast(fg: Color, bg: Color) -> f32 {
+        fn lum(c: Color) -> f32 {
+            let (r, g, b) = match c {
+                Color::Rgb(r, g, b) => (r, g, b),
+                _ => (0, 0, 0),
+            };
+            let ch = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+        }
+        let (a, b) = (lum(fg) + 0.05, lum(bg) + 0.05);
+        if a > b { a / b } else { b / a }
+    }
+
+    /// The reported bug: terminal output was far harder to read than the same
+    /// output in VSCode. Cause — the renderer resolves `Color::Indexed` through
+    /// a hardcoded *original xterm* table (red `#800000`, blue `#000080`), which
+    /// no builder option overrides. Those are unreadable on a dark background;
+    /// blue measured 1.06:1, which is invisible.
+    #[test]
+    fn the_ansi_palette_is_legible_unlike_the_xterm_defaults() {
+        let t = Theme::default();
+        let bg = t.terminal_bg;
+
+        let xterm_blue = Color::Rgb(0x00, 0x00, 0x80);
+        let xterm_red = Color::Rgb(0x80, 0x00, 0x00);
+        // Measured: blue 1.09:1, red 1.59:1 — at 1.0 the text *is* the
+        // background, so these were all but invisible.
+        assert!(contrast(xterm_blue, bg) < 1.2, "sanity: the old blue really was invisible");
+        assert!(contrast(xterm_red, bg) < 1.7, "sanity: the old red really was invisible");
+        // …and each is at least doubled by the palette we ship.
+        assert!(contrast(t.ansi[4], bg) > 2.0 * contrast(xterm_blue, bg), "blue must improve");
+        assert!(contrast(t.ansi[1], bg) > 2.0 * contrast(xterm_red, bg), "red must improve");
+
+        // Every colour a program is likely to write text in must clear a plain
+        // legibility bar. Black (index 0) is excluded: black-on-dark is
+        // unreadable everywhere, VSCode included, and programs don't use it for
+        // text — faking it would be a lie about what the palette is.
+        for (i, c) in t.ansi.iter().enumerate().filter(|(i, _)| *i != 0 && *i != 8) {
+            let ratio = contrast(*c, bg);
+            assert!(
+                ratio >= 2.5,
+                "ansi[{i}] {c:?} is {ratio:.2}:1 against the terminal background"
+            );
+        }
+        // The bright variants — what most tools actually colour output with —
+        // clear the WCAG large-text bar.
+        for (i, c) in t.ansi.iter().enumerate().skip(9) {
+            let ratio = contrast(*c, bg);
+            assert!(ratio >= 3.0, "bright ansi[{i}] {c:?} is only {ratio:.2}:1");
+        }
+    }
+
+    /// A lighter terminal surface *costs* contrast — it was tried as a fix for
+    /// the above and made every coloured foreground worse. Pinned so the two
+    /// are not "fixed" in opposite directions again.
+    #[test]
+    fn lifting_the_terminal_surface_would_cost_contrast() {
+        let t = Theme::default();
+        let lifted = Color::Rgb(0x26, 0x26, 0x2b);
+        let red = t.ansi[1];
+        assert!(
+            contrast(red, t.terminal_bg) > contrast(red, lifted),
+            "the darker surface must read better, or the revert was pointless"
+        );
+    }
+
+    #[test]
+    fn parses_hex_with_and_without_hash() {
+        assert_eq!(parse_hex("#ff8800"), Some(Color::Rgb(255, 136, 0)));
+        assert_eq!(parse_hex("ff8800"), Some(Color::Rgb(255, 136, 0)));
+        assert_eq!(parse_hex("nope"), None);
+        assert_eq!(parse_hex("#fff"), None);
+    }
+
+    #[test]
+    fn overrides_replace_named_colours() {
+        let mut theme = Theme::default();
+        let mut map = HashMap::new();
+        map.insert("accent".to_string(), "#010203".to_string());
+        map.insert("status_bg".to_string(), "#0a0b0c".to_string());
+        map.insert("unknown".to_string(), "#ffffff".to_string());
+        theme.apply_overrides(&map);
+        assert_eq!(theme.accent, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.status_bg, Color::Rgb(10, 11, 12));
+    }
+
+    #[test]
+    fn keyword_and_string_differ() {
+        let theme = Theme::default();
+        assert_ne!(theme.syntax_style("keyword"), theme.syntax_style("string"));
+    }
+
+    #[test]
+    fn focused_selection_matches_default_accent() {
+        let theme = Theme::default();
+        // Default accent is green; the selection bg is a darkened shade of it.
+        assert_eq!(theme.accent, Color::Rgb(0x4c, 0xaf, 0x50));
+        let sel = theme.selection(true);
+        assert_eq!(sel.bg, Some(Color::Rgb(0x1c, 0x42, 0x1e)));
+        assert_eq!(sel.fg, Some(Color::Rgb(0xff, 0xff, 0xff)));
+    }
+
+    #[test]
+    fn accent_override_syncs_selection_bg() {
+        let mut theme = Theme::default();
+        let mut map = HashMap::new();
+        map.insert("accent".to_string(), "#e53935".to_string()); // red
+        theme.apply_overrides(&map);
+        assert_eq!(theme.accent, Color::Rgb(0xe5, 0x39, 0x35));
+        // sel_bg derived from the new accent, not left green.
+        assert_eq!(theme.sel_bg, Color::Rgb(0x57, 0x15, 0x14));
+    }
+
+    /// The status bar belongs to the palette it's drawn in. It used to be
+    /// hardcoded to VSCode's `#007acc`, which sat as an unrelated blue band
+    /// under a green accent.
+    #[test]
+    fn the_status_bar_is_derived_from_the_accent() {
+        let t = Theme::default();
+        assert_eq!(t.status_bg, status_bar_bg(t.accent, t.bg));
+        assert_ne!(t.status_bg, Color::Rgb(0x00, 0x7a, 0xcc), "not VSCode's status blue");
+        // Between the accent and the background, not level with either: level
+        // with `bg` and it stops looking like a bar, level with the accent and
+        // it's a stripe of saturated colour across the window.
+        assert_ne!(t.status_bg, t.accent);
+        assert_ne!(t.status_bg, t.bg);
+    }
+
+    #[test]
+    fn changing_the_accent_moves_the_status_bar_with_it() {
+        let mut theme = Theme::default();
+        let before = theme.status_bg;
+        theme.set_accent((0xec, 0x40, 0x7a)); // pink
+        assert_ne!(theme.status_bg, before, "the bar follows the accent");
+        assert_eq!(theme.status_bg, status_bar_bg(theme.accent, theme.bg));
+    }
+
+    /// `examples/config.toml` is the documentation for what a config file may
+    /// contain, and it's shipped separately from the code that reads it — so
+    /// it's exactly where a key can rot. Every colour it demonstrates has to be
+    /// one the parser actually knows.
+    #[test]
+    fn the_example_config_only_documents_colours_that_parse() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/config.toml");
+        let text = std::fs::read_to_string(path).expect("examples/config.toml is shipped");
+        let doc: toml::Table = text.parse().expect("the example config has to be valid TOML");
+        let Some(theme) = doc.get("theme").and_then(|v| v.as_table()) else {
+            panic!("the example config should demonstrate a [theme] table");
+        };
+        let known: Vec<&str> = THEME_KEYS.iter().map(|(k, _)| *k).collect();
+        for key in theme.keys() {
+            assert!(
+                known.contains(&key.as_str()),
+                "examples/config.toml documents [theme] {key:?}, which nothing parses",
+            );
+        }
+        // And the file's "also: ansi_bright_*" note is only true if they exist.
+        for name in ["ansi_black", "ansi_white", "ansi_bright_blue", "ansi_bright_white"] {
+            assert!(known.contains(&name), "{name} is documented but missing from THEME_KEYS");
+        }
+    }
+
+    /// Every key the table names is settable end-to-end, not just present in a
+    /// list: each one is fed through the real override path and read back.
+    #[test]
+    fn every_theme_key_actually_sets_its_colour() {
+        for (key, _) in THEME_KEYS {
+            let mut t = Theme::default();
+            let mut overrides = HashMap::new();
+            overrides.insert((*key).to_string(), "#123456".to_string());
+            t.apply_overrides(&overrides);
+            let target = Color::Rgb(0x12, 0x34, 0x56);
+            let hit = THEME_KEYS
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, get)| *get(&mut t) == target)
+                .unwrap_or(false);
+            assert!(hit, "setting {key} didn't reach the field it names");
+        }
+    }
+
+}

@@ -1,0 +1,67 @@
+# Oxru configuration — copy to one of:
+#   ~/.config/oxru/config.toml          (applies everywhere)
+#   <your-project>/.oxru/config.toml    (applies to that project; wins over global)
+#
+# Everything is optional; anything left out keeps the default. A malformed file
+# is ignored rather than crashing the editor.
+
+# Icon set: "nerd" (default, needs a Nerd Font), "unicode", or "ascii".
+# The windowed (--gui) mode bundles its own fonts, so "nerd" works there.
+icons = "nerd"
+
+# The global to-do list lives at ~/.config/oxru/todos.md (⌥D to open it, ⌃E to
+# edit it as a normal tab). Clipboard history (⌥V) is in memory only and is
+# never written to disk.
+
+# Editor rendering. Both apply in the terminal and the window.
+[editor]
+current_line  = true   # tint the background of the row the caret is on
+indent_guides = true   # vertical rule at each indent level (width auto-detected)
+
+# Override any theme colour with a "#rrggbb" value. The editor chrome (borders,
+# titles, active tabs, folder names, highlights) follows `accent` — pick it from
+# the Settings dialog (Ctrl+,) or set it here. The values below are the defaults.
+[theme]
+bg           = "#1a1a1c"  # editor background
+bg_dark      = "#232327"  # dialog / tab-strip / footer background
+bg_light     = "#33333a"  # inactive selection, scrollbar thumb
+border       = "#3d3d46"  # borders and separators between surfaces
+line_hl      = "#282830"  # current-line tint for the row the caret is on
+indent_guide = "#33333a"  # the indent rules themselves
+terminal_bg  = "#1a1a1c"  # surface behind an embedded terminal; matches `bg` by
+                          # default. Lifting it sets the pane apart but costs
+                          # contrast on every coloured foreground.
+fg           = "#d4d4d4"  # primary text
+fg_dim       = "#858585"  # line numbers, dim labels
+accent       = "#4caf50"  # focus, active tabs, highlights, current line number
+accent_fg    = "#ffffff"  # text on filled accents
+status_bg    = "#2d5330"  # status bar — auto-derived from accent unless pinned
+# sel_bg (selected row) and status_bg are auto-derived from accent when you
+# change the accent in Settings, unless you pin them here.
+# The 16 ANSI colours terminal output asks for. Oxru supplies these itself —
+# the renderer's built-in table is the original xterm one (red #800000, blue
+# #000080), which is unreadable on a dark background. These are VSCode's.
+ansi_red     = "#cd3131"
+ansi_green   = "#0dbc79"
+ansi_yellow  = "#e5e510"
+ansi_blue    = "#2472c8"
+ansi_magenta = "#bc3fbc"
+ansi_cyan    = "#11a8cd"
+# also: ansi_black, ansi_white, and ansi_bright_* for all eight bright variants
+
+# token colours (also used by syntax highlighting):
+green        = "#6a9955"  # comments
+orange       = "#ce9178"  # strings
+blue         = "#569cd6"  # keywords
+yellow       = "#dcdcaa"  # functions
+cyan         = "#4ec9b0"  # types
+# also: red, purple, comment, sel_bg, find_match, find_current
+
+# Windowed-mode settings. The Settings dialog changes these live and writes
+# them back here.
+[gui]
+font_size   = 24    # logical points
+fps         = 60    # 1, 5, 10, 20, 30 or 60 — throttles unattended output only
+dialog_size = 85    # percent of the window a dialog covers (50-99)
+word_wrap   = false # soft-wrap long lines to the pane width
+padding     = 1     # columns of margin at the left/right window edges
